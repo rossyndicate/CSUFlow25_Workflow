@@ -8,6 +8,8 @@ exploratory_scripts\hydrologic_signatures\data\basins
 """
 import pandas as pd
 import os
+import numpy as np
+
 wd = os.getcwd()
 # read in gridmet
 gDf = pd.read_csv(os.path.join(wd,r"exploratory_scripts\hydrologic_signatures\data\gridmet_2000-01-01_2024-11-15.csv")) # Gridmet variables
@@ -29,6 +31,7 @@ fDf = fDf.rename(columns={'00060_Mean':'Q_cfs'}) # rename this column
 fDf['gage'] = fDf['gage'].astype(str).str.zfill(8) # convert to string and put zeros at the beginning until its 8 characters long since that's what USGS gage IDs are
 fDf.index = pd.to_datetime(fDf['dt'], utc=True) # make the datetime the index, make it timezone unaware
 fDf = fDf.drop(columns=['dt'])
+fDf['Q_cfs'] = np.where(fDf['Q_cfs']<0, np.nan, fDf['Q_cfs']) # make negative values np.nan
 
 # create a list for static attributes
 basinChars = []
