@@ -148,7 +148,7 @@ fetchNHD_flowlines <- function(.data){
   # fields <- arcgislayers::list_fields(nhd_hr_flowlines)
   
   # TODO: update the query for only artificial stuff
-  query <- "Ftype IN (428, 420, 336, 468, 558)"
+  # query <- "Ftype IN (428, 420, 336, 468, 558)"
   
   # Here is where the intersection happens, which is really just a filter based on 
   # the shape of the watersheds. The flow lines seem to be cut off at the edge of the polygons,
@@ -156,7 +156,7 @@ fetchNHD_flowlines <- function(.data){
   for(i in 1:length(geospatial_aoi)){
     tryCatch({
       nhd_flowlines[[i]] <- arcgislayers::arc_select(nhd_hr_flowlines,
-                                                     where = query,
+                                                     # where = query,
                                                      filter_geom = geospatial_aoi[i],
                                                      crs = st_crs(geospatial_aoi[i])) %>% 
         st_make_valid()},
