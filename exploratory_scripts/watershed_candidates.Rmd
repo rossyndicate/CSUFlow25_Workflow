@@ -66,7 +66,7 @@ test_flowline <- map(1:5, ~{
 }) %>%
   set_names(filter_watersheds$site_no[1:5])
 ```
-
+This uses NLDI finder, which is too coarse for our workflow.
 ```{r}
 # Test intersection function solution with one watershed
 # set sample site ID number
@@ -94,6 +94,7 @@ mapview(sample_site$gage_coords) +
   mapview(sample_intersection_lines)
 ```
 
+This function needs to be updated with the new watershed delineation method
 ```{r}
 #' @params
 #' gage_id = gage_id
@@ -159,4 +160,77 @@ walk(example_gages$site_no,
                           polygon_list = example_watersheds, # update these lists
                           polyline_list = test_flowline)))
 ```
+The `nldi_finder` function that had been used was deemed to coarse for the analysis 
+that we are performing, so we are going to use `get_split_catchment` from {nhdplusTools}
+instead.
+
+```{r}
+# get split catchment needs the points to be in the following format:
+gage_points <- map(.x = example_gages$gage_coords, ~{sf::st_sfc(sf::st_point(x = .x), crs = 4326)})
+```
+
+```{r}
+better_termination <- get_split_catchment(gage_points[[1]], upstream = T)[2,]
+```
+
+
+```{r}
+mapview(better_termination) + mapview(gage_points[[1]])
+```
+
+The watershed that I got from get_split_catchment is very different from the one
+that I got from NLDI finder
+```{r}
+mapview(filter(example_watersheds, site_no == "09378490")) + mapview(example_gages$gage_coords[1]) +
+  mapview(better_termination) + mapview(gage_points[[1]])
+```
+
+Lets try to get the watershed with the arcgislayers method
+```{r}
+nhd_plus_hr_url <- "https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer"
+
+# open the nhd_hr - which contains a bunch of layers
+nhd_hr <- arcgislayers::arc_open(nhd_plus_hr_url)
+
+# list the layers of the nhdhr object
+# need to uncomment this ----
+  # hoping to find ditches here 
+# arcgislayers::list_items(nhd_hr)
+
+# select the layer by id from the items list called above (10 is HR catchments)
+nhd_hr_catchments <- arcgislayers::get_layer(nhd_hr, 10)
+
+nhd_catchments <- vector("list", length = length(gage_points)) # dataframe of each watershed
+
+for(i in 1:length(gage_points)){
+  try(nhd_catchments[[i]] <- arcgislayers::arc_select(nhd_hr_catchments,
+                                                      # where = query,
+                                                      filter_geom = gage_points[[i]],
+                                                      crs = sf::st_crs(gage_points[[i]])) %>%
+        sf::st_make_valid(), silent = TRUE)
+}
+
+nhd_catchments <- nhd_catchments %>%
+  purrr::keep(~!is.null(.))
+
+try(nhd_catchments <- nhd_catchments %>% 
+      dplyr::bind_rows() %>%
+      dplyr::distinct(), 
+    silent = TRUE)
+```
+
+```{r}
+gage_point_1 <- gage_points[[1]]
+arc_catchment <- arcgislayers::arc_select(nhd_hr_catchments,
+                                          filter_geom = gage_point_1,
+                                          crs = sf::st_crs(gage_point_1)) %>%
+  sf::st_make_valid()
+```
+
+```{r}
+mapview(gage_point_1) + mapview(arc_catchment) +
+  mapview(filter(example_watersheds, site_no == "09378490")) + mapview(example_gages$gage_coords[1]) +
+  mapview(better_termination) + mapview(gage_points[[1]])
+```
+
 
