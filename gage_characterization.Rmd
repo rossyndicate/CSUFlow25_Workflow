@@ -1,0 +1,683 @@
+---
+title: "Delineating Watersheds, Grabbing Data"
+author: "Katie Willi"
+date: "2024-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(terra)
+library(elevatr)
+library(dataRetrieval)
+library(nhdplusTools)
+library(StreamCatTools)
+library(tmap)
+library(climateR)
+library(data.table)
+library(mapview)
+```
+
+## Grab all USGS gages
+
+Using the dataRetrieval package in R, locate all USGS stream gages under 1500 square kilometers that measure discharge.
+
+```{r}
+states_oi <- c("Colorado")#, "Wyoming", "Utah", "Kansas")
+
+us_sf_object <- tigris::states() %>% 
+  filter(NAME %in% states_oi) 
+
+# Get a list of NWIS sites for all of the states
+nwis_sites_by_state <- map(us_sf_object$STUSPS, 
+                           ~{
+                             discharge_sites <- whatNWISsites(stateCd = .x, parameterCd = "00060") %>% 
+                               filter(site_tp_cd == 'ST') 
+                             
+                             # Only use gages under 1500 square kilometers (as defined by the USGS):
+                             small_enough <- readNWISsite(discharge_sites$site_no) %>%  
+                               mutate(drain_area_km = drain_area_va *  2.58999) %>%  
+                               filter(drain_area_km <= 1500) %>%
+                               # For future tracking with the NLDI:
+                               mutate(site_pretty=paste0("USGS-",site_no))
+                             
+                             return(small_enough)
+                           }
+)
+
+nwis_sites <- bind_rows(nwis_sites_by_state) %>%
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
+
+mapview(nwis_sites)
+```
+
+## Subset to gages with data since 1980 with at least 30 years of data
+
+This is a Katie choice that hasn't been run by MR of SK. But! To reduce our gages to only those with data during the time period we want (... which, I personally don't know what that is - you will need to confirm this with MR and SK) will reduce the number of watersheds you'll have to manually verify substantially. So, here I am filtering our gages to only sites that have at least 30 years worth of daily data starting in 1980. Meaning, if a gage only measured discharge before 1980, we are removing them as candidate gages. We are also removing any gages that don't have at least 30 years of data since 1980.
+
+```{r}
+  gage_meta <- dataRetrieval::whatNWISdata(siteNumber = nwis_sites$site_no, parameterCd = "00060")
+
+  tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
+    rvest::html_nodes('table') %>%
+    rvest::html_table()
+  
+  pcodes <- tables[[1]] %>% 
+    janitor::clean_names() %>% 
+    dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
+  
+  inventory <- gage_meta %>%
+    dplyr::left_join(pcodes,by="parm_cd") %>%
+    dplyr::select(c(site_name = station_nm,
+                    site_no,
+                    data_type_cd,
+                    site_type_cd = site_tp_cd,
+                    n_obs=count_nu,
+                    begin_date,
+                    end_date,
+                    parameter=parameter_name_description,
+                    code=parm_cd))
+  
+  site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
+  
+  table <- rvest::read_html(site_url) %>%
+    rvest::html_nodes('table') %>%
+    rvest::html_table() #%>%
+  
+  table <- rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
+    dplyr::select(site_type_cd = 1,
+                  site_type = 2)
+  
+  inventory <- left_join(inventory,table,by='site_type_cd') %>%
+    mutate(data_type=case_when(data_type_cd=="dv" ~ "Daily",
+                               data_type_cd=="uv" ~ "Unit",
+                               data_type_cd=="qw" ~ "Water Quality",
+                               data_type_cd=="gw" ~ "Groundwater Levels",
+                               data_type_cd=="iv" ~ "Unit",
+                               data_type_cd=="sv" ~ "Site Visits",
+                               data_type_cd=="pk" ~ "Peak Measurements",
+                               data_type_cd=="ad" ~ "USGS Annual Water Data Report",
+                               data_type_cd=="aw" ~ "Active Groundwater Level Network",
+                               data_type_cd=="id" ~ "Historic Instantaneous"))
+
+  new_data_gages <- inventory %>%
+    filter(year(end_date) >= "1980",
+           data_type == "Daily") %>%
+    # and only sites with at least 30 years worth of data -ish
+    filter(n_obs >= 365*30)
+  
+  # Only keep gages with data during or after 1980:
+  nwis_sites <- nwis_sites %>% 
+    filter(site_no %in% new_data_gages$site_no)
+```
+
+Grab CO DWR gages... not currently running this but here's the code for when you want to begin including those gages as well.
+
+```{r, eval = FALSE}
+cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
+  httr::content(., as = "text", encoding = "UTF-8") %>%
+  jsonlite::fromJSON() %>%
+  .[["ResultList"]] %>%
+  filter(year(endDate) >= "1980") %>%
+  filter(is.na(usgsSiteId)) %>%
+  filter(!is.na(longitude) & !is.na(latitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4269) %>%
+  # Obnoxiously station type cannot be accessed on API only GUI
+  filter(abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>%
+  select(site_no = abbrev,
+         station_nm = stationName)
+
+# Bind CO DWR and USGS sites together
+
+nwis_sites <- nwis_sites %>% bind_rows(cdwr_sites)}
+```
+
+## Delineate stream gage watersheds
+
+For this analysis, we are relying on NHDPlus Version 2. We are able to delineate a stream gage's upstream contributing area (i.e., its watershed) by leveraging the NHD's network index that, for every stream feature in the NHD, identifies all other stream features upstream of it. So, our first task is to find out which NHD stream feature each gage is associated with. All stream features are given a unique ID, called a comid. Every stream feature also has an associated "catchment", or direct contributing area, with the same comid. So here, we are identifying the comid for the stream feature each gage is associated with. **DANGER: YOU WILL NEED TO CONFIRM THE APPROPRIATE FLOWLINE IS SELECTED FOR EVERY GAGE. THERE IS NO WAY TO CONFIRM THEY ARE RIGHT WITHOUT EYEBALLING THEM!**
+
+```{r}
+nwis_sites$comid <- NA # attempt 'get_nldi_feature()' first
+nwis_sites$comid_coords <- NA # if that doesn't work for all gages, do 'discover_nhdplus_id()'
+
+# first try to get comid using nldi ("verified" correct comid - or at least what USGS says it is)
+for(i in 1:nrow(nwis_sites)){
+  try(nwis_sites$comid[i] <- get_nldi_feature(list("featureSource" = "nwissite", featureID = nwis_sites[i,]$site_pretty))$comid, silent = T)
+}
+
+# get the comid using the weirdos' coordinates instead of their gage name
+for(i in 1:nrow(nwis_sites)){
+  nwis_sites$comid_coords[i] <- discover_nhdplus_id(nwis_sites[i,])
+}
+
+# back it up if you want:
+# saveRDS(nwis_sites, 'data/nwis_gages_comid.RDS')
+
+# Ones where the USGS says they fall on a comid they don't technically fall on. For these, it is highly likely that you will need to go 
+# one-by-one to identify which COMID is actually appropriate to attribute to them: 
+weirdos <- nwis_sites %>% filter(comid_coords != comid)
+
+mapview(weirdos) + mapview(get_nhdplus(comid = weirdos$comid), color = "blue", layer.name = "By NLDI") + mapview(get_nhdplus(comid = weirdos$comid_coords), color = "red", layer.name = "By coordinates")
+
+nwis_sites <- nwis_sites %>%
+  # UPDATE THIS SECTION - This is where the exercise above will dictate which of the comids is most appropriate to use for each gage.
+  # For now, just removing the weirdos.
+  mutate(comid_new = ifelse(is.na(comid), comid_coords, comid)) %>%
+  filter(comid_coords == comid) %>%
+  select(site_no, station_nm, comid = comid_new) %>%
+  mutate(comid = as.numeric(comid)) 
+  
+```
+
+##### Delineate each gage's watershed
+
+Now that we have a list of our gages and their associated NHDPlus V2 stream features, we can use the NHD indexing to "crawl" upstream of each gage's flowline, then grab each flowline's catchment, and lastly dissolve those catchments into a single polygon the represents the gage's upstream contributing area (i.e., its watershed):
+
+```{r}
+# load in the NHD as a table. This table lists all COMIDs in CONUS and allows you to "navigate" the NHD.
+nhd <- read_csv("data/nhd_flow_network.csv")
+
+# function to delineate each gage's watershed:
+watershed_delineator <- function(site_list){
+  
+  # filter our master list to just the gage we are iterating over
+  site <- nwis_sites %>%
+    filter(site_no == site_list)
+  
+  
+  # use get_UT to list all comids that are upstream of our gage using the comid the
+  # gage falls on:
+  upstream <- nhdplusTools::get_UT(nhd, site$comid)
+  
+  
+  # grab all the catchments associated with the upstream comids:
+  nhd_catch <- nhdplusTools::get_nhdplus(comid = upstream,
+                                   realization = 'catchment',
+                                   t_srs = 4269) %>%
+    # remove dupes (precautionary step, not likely necessary)
+    dplyr::distinct(featureid, .keep_all=TRUE) %>%
+    # "dissolve" all the catchments into a single polygon
+    dplyr::summarize() %>%
+    # remove weird hole by-products that exist if the catchment boundaries don't
+    # line up perfectly:
+    nngeo::st_remove_holes() %>%
+    # tack on the site name and comid to the watershed
+    dplyr::mutate(site_no = site$site_no,
+                  comid = site$comid)
+  # back it up:
+  saveRDS(nhd_catch, paste0("data/watersheds/", site$site_no, ".RDS"))
+  
+  print(paste0(site$station_nm, " delineated!"))
+  
+  # return the delineated watershed
+  return(nhd_catch)
+  
+}
+
+# Create a vector of nwis sites to iterate over
+watersheds <- nwis_sites$site_no %>%
+  #... then delineate each site's watershed:
+  map(~watershed_delineator(.)) %>%
+  bind_rows()
+
+mapview::mapview(watersheds)
+```
+
+## Grab explanatory variables
+
+Link up gages with streamcat variables. StreamCat watershed statistics are available for every stream feature in the NHDPlusV2. StreamCat uses the comid as the identifier so we can link up information that way. A complete list of available variables you can pull is found in the vars table below. I am NOT pulling in all the available info that you can because these soooo much!
+
+```{r}
+# Grab a list of all available streamcat variables:
+download.file("https://java.epa.gov/StreamCAT/metrics/variable_info.csv",
+              destfile = paste0(getwd(), "/data/StreamCatVars.csv"))
+
+# This table describes all the available variables in streamcat. Look here
+# if you want to explore other vars, or the descriptions of the ones I've
+# selected here:
+vars <- read_csv("data/StreamCatVars.csv")
+
+# This is what's available on StreamCat related to lithology. Likely not identical to what
+# was used by Abby but hopefully good swap:
+lithology_vars <- c("PctAlkIntruVol", "PctWater",
+                    "PctSilicic",      "PctSalLake",    
+                    "PctNonCarbResid", "PctHydric",      
+                    "PctGlacTilLoam",  "PctGlacTilCrs",  
+                    "PctGlacTilClay",  "PctGlacLakeFine",
+                    "PctGlacLakeCrs",  "PctExtruVol",   
+                    "PctEolFine",      "PctEolCrs",      
+                    "PctColluvSed",    "PctCoastCrs",    
+                    "PctCarbResid",    "PctAlluvCoast")
+
+# Urban cover (add all together to get percent of total urban cover): 
+# Many available years. Which do we want to use? For now using 2011:
+urban_cover <- c("PctUrbOp2019", "PctUrbMd2019", "PctUrbLo2019", "PctUrbHi2019")
+
+# PRISM mean precip for 1981-2010 OR 1991-2020
+prism_precip <- c("Precip8110", "Precip9120")
+
+# These are all the variables Fred was interested in for describing flow
+# in his work. Likely a good starting point for our needs, too. 
+fred_vars <- c("CanalDens", 
+               # BFI
+               "BFI", 
+               #NLCD 2019
+               "PctOw2019", "PctIce2019", "PctUrbOp2019", "PctUrbLo2019", "PctUrbMd2019", "PctUrbHi2019",
+               "PctBl2019", "PctDecid2019", "PctConif2019", "PctMxFst2019", "PctShrb2019",  "PctGrs2019", 
+               "PctHay2019", "PctCrop2019",  "PctWdWet2019", "PctHbWet2019", 
+               # Dam Info
+               "DamDens", "DamNIDStor", "DamNrmStor",
+               # Elevation
+               "Elev", 
+               # Impervious Surfaces across a bunch of years:
+               "PctImp2006", "PctImp2008", "PctImp2011", "PctImp2001",
+               "PctImp2013", "PctImp2019", "PctImp2016", "PctImp2004",
+               # PRISM 1991-2020
+               "Precip9120", "Tmax9120", "Tmean9120", "Tmin9120",
+               # STATSGO variables:
+               "Clay", "Sand", "Silt", "WtDep", "Om", "Perm", "RckDep")
+
+streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(c(lithology_vars, urban_cover, prism_precip, fred_vars), collapse = ","),
+                                      aoi = 'watershed', 
+                                      comid = nwis_sites$comid) %>%
+  # remove variables we don't particularly care about that get returned:
+  select(-contains("AREASQKM"))
+
+watersheds_streamcat <- watersheds %>%
+  left_join(., streamcat_vars, by = c("comid" = "COMID")) %>%
+  mutate(PCTURB2019WS = PCTURBHI2019WS + PCTURBMD2019WS + PCTURBLO2019WS + PCTURBOP2019WS)
+```
+
+## Find reference quality gages:
+
+Using the StreamCat variables, we can drop any gages who have characteristics that make them unsuitable as reference gages. For example, we can remove any gages whose watersheds have \>= 10% urban landcover and watersheds that have dam storage densities larger than 100 megaliters/square kilometer:
+
+```{r}
+ref_watersheds <- watersheds_streamcat %>%
+  filter(PCTURB2019WS < 10) %>%
+  filter(DAMNIDSTORWS < 100000)
+# REMOVE THIS STEP ONCE "GOOD" WATERSHEDS HAVE BEEN IDENTIFIED:
+# But for now, this is a quick and lazy way of getting rid of watersheds
+# we know were delineated incorrectly. They were delineated incorrectly
+# because their attributed comids are wrong. (See comment about the weirdos
+# object above):
+ref_watersheds <- ref_watersheds %>% mutate(area = sf::st_area(ref_watersheds)) %>%
+  # remove any watersheds larger than 1600 km (for some conservative wiggle 
+  # with projection differences)
+  filter(as.numeric(area) <= 1.6e+9)
+```
+
+And, we can drop any gages whose watersheds contain a transbasin diversion. We identify watersheds that have a transbasin diversion by grabbing NHD HR flowlines features that intersect the watershed. We are using NHD HR instead of NHDPlusV2 because the NHDHR has flowline features that are identified as being canals, ditches, etc. With that info, we identify watersheds where any of those "unnatural" features cross over the watershed boundary. If a canal/ditch crosses over a watershed boundary, that means that water is being moved in or out of the watershed unnaturally.
+
+```{r}
+fetch_flowlines <- function(site_list){
+  
+  site <- watersheds %>%
+    filter(site_no == site_list)
+  
+  # open the nhd_hr - which contains a bunch of layers
+  nhd_hr <- arcgislayers::arc_open("https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer")
+  
+  # arcgislayers::list_items(nhd_hr)
+  
+  nhd_hr_flowlines <- arcgislayers::get_layer(nhd_hr, 3)
+  
+  # use bbox to return associated flowlines
+  geospatial_aoi <- site %>% 
+    # add a buffer around the watershed for visualization later on
+     st_buffer(1000) %>% 
+    # Convert sf object to sfc object (required for downloading from the map server)
+    st_as_sfc(.)
+  
+  nhd_flowlines <- vector("list", length = length(geospatial_aoi))
+  
+    tryCatch({
+      nhd_flowlines <- arcgislayers::arc_select(nhd_hr_flowlines,
+                                                     # where = query,
+                                                     filter_geom = geospatial_aoi,
+                                                     crs = st_crs(geospatial_aoi)) %>% 
+        st_make_valid()},
+      error = function(e){
+        cat("Index ", i, " from input data failed.")
+      }) 
+
+  nhd_flowlines <- nhd_flowlines %>% 
+    keep(~!is.null(.))
+  
+  try(nhd_flowlines <- nhd_flowlines %>% 
+        dplyr::bind_rows() %>%
+        dplyr::distinct() %>%
+        mutate(#natural = ifelse(ftype == 460, T, F),
+               flowline_type = case_when(ftype == 460 ~ "natural",
+                                         ftype == 558 ~ "artificial path",
+                                         ftype == 468 ~ "drainageway",
+                                         ftype == 336 ~ "canal ditch",
+                                         ftype == 566 ~ "coastline",
+                                         ftype == 334 ~ "connector",
+                                         ftype == 428 ~ "pipeline",
+                                         ftype == 420 ~ "underground conduit",
+                                         .default = "unnatural")), 
+      silent = TRUE)
+  
+  
+  saveRDS(nhd_flowlines, paste0("data/flowlines/", site_list, ".RDS"))
+  
+  print(paste0(site_list, " done!"))
+  
+  return(nhd_flowlines)
+  
+}
+
+all_flowlines <- ref_watersheds$site_no %>%
+  map(~fetch_flowlines(.)) %>%
+  bind_rows() %>%
+  distinct()
+
+# in fetchNHD_flowlines, we have categorized each flowline as being natural or unnatural.
+# So, we can subset the flowlines to just the unnatural ones. 
+all_flowlines_unnatural <- all_flowlines %>%
+    filter(flowline_type != "natural") 
+
+transbasin_finder <- function(site_list){
+  
+# filter our master list to just the gage's watershed we are iterating over
+  site <- ref_watersheds %>%
+    filter(site_no == site_list)
+  
+    flowlines <- readRDS(paste0("data/flowlines/", site$site_no, ".RDS"))
+
+flowlines_unnatural <- flowlines %>%
+    filter(flowline_type != "natural") 
+  
+  # For linestring transformation step to work, need the watershed to be a polygon object:
+    if (st_geometry_type(site) != "POLYGON") {
+    # If not, cast to a Polygon... which will "explode" it into multiple. 
+      # This is a rare thing... I think...
+    site <- st_cast(site, "POLYGON") 
+  }
+  
+  polyline <-  site %>% st_cast("LINESTRING")
+
+  crossovers <- flowlines_unnatural %>%
+    .[polyline,] %>%
+    nrow()
+  
+# Some watersheds are multipolygons and therefore need to be put back together here:
+  site <- site %>% group_by(site_no, comid) %>% summarize() %>%
+    mutate(transbasin = ifelse(crossovers > 0, "TRANSBASIN DIVERSION", "NATURAL")) 
+
+  # Extract the bounding box of the site_data
+bbox_site <- st_bbox(site)
+
+# Create the ggplot map, zoomed to the bounding box of site_data
+gg_map <- ggplot() +
+  # Plot the site data
+  geom_sf(data = site, color = "black", fill = "white", size = 1) + 
+    # Plot the site data
+  geom_sf(data = filter(nwis_sites, site_no == site$site_no), color = "lightblue", size = 5.5) + 
+  # Plot the natural flowlines in blue
+  geom_sf(data = flowlines, color = "blue", size = 0.5) + 
+    # Plot the unnatural flowlines in red
+  geom_sf(data = flowlines_unnatural, color = "red", size = 2) + 
+  # Set the xlim and ylim based on the bounding box of site_data
+  xlim(bbox_site["xmin"], bbox_site["xmax"]) +
+  ylim(bbox_site["ymin"], bbox_site["ymax"]) +
+  coord_sf() + 
+  theme_void() +
+  labs(title = paste0(site$site_no, " ", site$transbasin)) +  
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),  
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+
+# Save the map as an image
+ggsave(gg_map, filename = paste0("data/transbasin_confirm/", site$transbasin, "_", site$site_no, ".png"))
+
+print(site$site_no)
+  return(site)
+  
+}
+
+watersheds_div <- ref_watersheds$site_no %>%
+  map(~transbasin_finder(.)) %>%
+  bind_rows() %>%
+  st_make_valid()
+
+```
+
+Reduce our reference gages to only gages without a transbasin diversion:
+
+```{r}
+ref_watersheds <- watersheds_div %>%
+  filter(transbasin == "NATURAL")
+```
+
+### Grab other variables not found in stream cat:
+
+#### Dominant watershed aspect
+
+Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there's an easier approach than what I'm presenting here. I grab raw elevation DEMs, get the aspect (in degrees) for each grid cell, then convert those raw aspects (in degrees) into categorical N, E, S, W cardinal directions as displayed in this image below:
+
+![](data/compassrose.jpg)
+
+```{r}
+aspect_finder <- function(site_list){
+  
+  # create numerical representation for each cardinal aspect:
+  aspect_lookup <- tibble(val = c(1, 2, 3, 4),
+                          aspect = c("North", "East", "South", "West"))
+  
+  # filter our master list to just the gage's watershed we are iterating over
+  site <- ref_watersheds %>%
+    filter(site_no == site_list)
+  
+  # grab elevation data
+  elev <- elevatr::get_elev_raster(summarize(site), z = 12, clip = "locations") %>% # zoom of 12 is close-ish(?) to 30 meters... JD should confirm!
+    terra::rast() %>% 
+    # clip to extent of the watershed
+    terra::mask(., site, touches = FALSE)
+  
+  # calculate aspect from the masked elevation
+  aspect <- terra::terrain(elev, v = 'aspect')
+  
+  # convert aspect values to cardinal directions
+  convert_to_direction <- function(aspect) {
+    direction <- rep(NA, length(aspect))
+    direction[aspect >= 0 & aspect <= 45 | aspect > 315 & aspect <= 360] <- 1  # North
+    direction[aspect > 45 & aspect <= 135] <- 2  # East
+    direction[aspect > 135 & aspect <= 225] <- 3  # South
+    direction[aspect > 225 & aspect <= 315] <- 4  # West
+    return(direction)
+  }
+  
+  # apply the conversion directly to the raster values
+  aspect_cardinal_raster <- terra::app(aspect, fun = convert_to_direction) 
+  
+  #Map showing what this aspect layer looks like geospatially:
+  plot(aspect_cardinal_raster)
+  
+  # Calculate the mode (dom aspect) in each watershed
+  dominant_aspect <- as.data.table(aspect_cardinal_raster) %>%
+    rename(val = lyr.1) %>%
+    group_by(val) %>%
+    summarize(count = n()) %>%
+    filter(count == max(count)) %>%
+    left_join(aspect_lookup, by = "val") %>%
+    mutate(site_no = site$site_no)
+  
+}
+
+watershed_aspects <- ref_watersheds$site_no %>%
+  map(~aspect_finder(.)) %>%
+  bind_rows()
+```
+
+#### GridMET climate data
+
+gridMET is DAILY gridded climate data. I am pulling in daily data for all grid cells that overlap each watershed for days in 2001-2020. Namely, I'm downloading max temperature, min temperature, PET, and precipitation. Then, I'm averaging that data across the watershed to get a single, average value for the watershed. See the function `get_climate_historic()` if you want to see how the raw gridMET data is pulled in.
+
+```{r}
+
+get_climate_historic <- function(sf,
+                                 col_name,
+                                 start = "1979-01-01",
+                                 end = "2023-12-31",
+                                 vars = c("tmmx", "tmmn", "pr", "pet")) {
+  
+  sf <- sf %>%
+    dplyr::rename("join_index" = {{col_name}})
+  
+  all_climate_data <- vector("list", length = nrow(sf))
+  
+  if(any(unique(sf::st_geometry_type(sf)) %in% c("POLYGON", "MULTIPOLYGON"))){
+    
+    for (i in 1:nrow(sf)) {
+      
+      aoi <- sf[i,]
+      
+      print(paste0('Downloading GridMET for ', aoi$join_index, "."))
+      
+      clim <- climateR::getGridMET(AOI = aoi,
+                                   varname = vars,
+                                   startDate = start,
+                                   endDate = end)
+      
+      
+      if(inherits(clim[[1]], "SpatRaster")){
+        
+        
+        clim_crs <- crs(clim[[1]])
+        
+        if(st_crs(clim[[1]]) != st_crs(sf)){
+          
+          clim <- clim %>%
+            purrr::map(
+              # getGridMET defaults AOI to bbox - so crop / mask results to sf extent
+              ~terra::crop(., st_transform(aoi, crs = clim_crs), mask = TRUE),
+              crs = clim_crs)
+        } else {
+          
+          clim <- clim %>%
+            purrr::map(
+              # getGridMET defaults AOI to bbox - so crop / mask results to sf extent
+              ~terra::crop(., aoi, mask = TRUE),
+              crs = clim_crs)
+          
+        }
+        
+        all_climate_data[[i]] <- clim %>%
+          purrr::map_dfr(~ as.data.frame(., xy = TRUE)) %>%
+          data.table() %>%
+          pivot_longer(-(x:y),
+                       names_to = "var_temp",
+                       values_to = "val") %>%
+          separate_wider_delim(var_temp, "_", names = c("var", "date")) %>%
+          drop_na(val) %>%
+          group_by(x, y, date) %>%
+          pivot_wider(names_from = "var", values_from = "val") %>%
+          dplyr::mutate(date = as.Date(date),
+                        pet_mm = pet,
+                        ppt_mm = pr,
+                        tmax_C = tmmx - 273.15,
+                        tmin_C = tmmn - 273.15,
+                        tmean_C = (tmax_C + tmin_C)/2,
+                        join_index = aoi$join_index) %>%
+          dplyr::select(-c("tmmx", "tmmn", "pr", "pet"))
+        
+        saveRDS(all_climate_data[[i]], paste0("data/climate/", aoi$join_index, ".RDS"))
+        
+      } else {
+        
+        all_climate_data[[i]] <- clim %>%
+          data.table() %>%
+          # names of columns include va_mode_rcp so must rename
+          rename_with(~ str_split(.x, "_", n = 2) %>% map_chr(1)) %>%
+          # since polygon grabbed a single grid, gridMET does not provide the coordinates
+          # of the gridMET cell, so we fill in x and y with the coordinates
+          # of the sf object:
+          dplyr::mutate(x = sf::st_coordinates(aoi)[[1]],
+                        y = sf::st_coordinates(aoi)[[2]]) %>%
+          # Then do all other cleaning steps done for polygon sf objects:
+          dplyr::mutate(date = as.Date(date),
+                        pet_mm = pet,
+                        ppt_mm = pr,
+                        tmax_C = tmmx - 273.15,
+                        tmin_C = tmmn - 273.15,
+                        tmean_C = (tmax_C + tmin_C)/2,
+                        join_index = aoi$join_index) %>%
+          dplyr::select(-c("tmmx", "tmmn", "pr", "pet"))
+        
+        saveRDS(all_climate_data[[i]], paste0("data/climate/", aoi$join_index, ".RDS"))
+        
+      }
+    }
+    
+    all_climate_data <- all_climate_data %>%
+      bind_rows()
+    
+    # Rename the join_index column
+    colnames(all_climate_data)[colnames(all_climate_data) == "join_index"] <- {{col_name}}
+    
+    return(all_climate_data)
+    
+  } else {stop("Your sf feature is neither a polygon nor point feature, or it needs to be made valid.")}
+  
+}
+
+watershed_climate <- get_climate_historic(sf = ref_watersheds,
+                                          col_name = "site_no", 
+                                          # Snow persistence start
+                                          start = "2001-01-01",
+                                          # Snow persistence end
+                                          end = "2020-12-31",
+                                          vars = c("pet", "pr", "tmmn", "tmmx")) %>%
+  group_by(site_no) %>% 
+  summarize(pet_mm_2001_2020 = mean(pet_mm, na.rm = TRUE),
+            ppt_mm_2001_2020 = mean(ppt_mm, na.rm = TRUE), 
+            tmax_C_2001_2020 = mean(tmax_C, na.rm = TRUE), 
+            tmin_C_2001_2020 = mean(tmin_C, na.rm = TRUE))
+```
+
+#### Snow persistence
+
+Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is annual snow persistence data from 2001-2020. Using the {terra} package, I get the area-weighted annual average snow persistence value for each watershed, then average each year's data together to get a single time- and area-weighted average for each watershed.
+
+```{r}
+# sp_preview <- rast("data/snow_persistence_hammond/MOD10A2_SCI_2020.tif")
+# 
+# tm_shape(sp_preview) + 
+#   tm_raster(palette = "viridis", title = "Snow Persistence") +
+#   tm_layout(frame = FALSE)
+
+# load all the .tif files into a list
+tif_files <- list.files("data/snow_persistence_hammond/", pattern = "\\.tif$", full.names = TRUE)
+
+# stack the snow persistence .tif files into a single raster stack
+raster_stack <- rast(tif_files)
+
+# convert the shapefile to a 'terra' object (if necessary)
+polygon <- st_transform(ref_watersheds, crs(raster_stack))  # Align CRS
+
+# convert the polygons to 'terra' vector format
+polygon_terra <- vect(polygon)
+
+# mask the raster stack to the watershed polygons
+masked_stack <- mask(raster_stack, polygon_terra)
+
+# extract mean SP across each watershed. weights = TRUE means get the area-weighted average
+mean_sp <- extract(masked_stack, polygon_terra, fun = mean, weights = TRUE)
+
+# convert the results to a data frame listing each gage's SP
+watershed_sp <- as_tibble(mean_sp) %>%
+  bind_cols(st_drop_geometry(ref_watersheds)) %>%
+  select(-ID) %>%
+  pivot_longer(cols = c(contains("MOD"))) %>%
+  group_by(site_no, comid, transbasin) %>% 
+  summarize(mean_sp_2001_2020 = mean(value))
+```
