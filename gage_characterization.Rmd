@@ -10,17 +10,36 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r}
-library(tidyverse)
-library(sf)
-library(terra)
-library(elevatr)
-library(dataRetrieval)
-library(nhdplusTools)
-library(StreamCatTools)
-library(tmap)
-library(climateR)
-library(data.table)
-library(mapview)
+# To install StreamCatTools:
+# library(remotes)
+# install_github("USEPA/StreamCatTools", build_vignettes=FALSE)
+
+# To install climateR:
+# library(remotes)
+# remotes::install_github("mikejohnson51/AOI") # suggested!
+# remotes::install_github("mikejohnson51/climateR")
+
+packages <- c('tidyverse',
+              'sf',
+              'terra',
+              'elevatr', 
+              'dataRetrieval',
+              'nhdplusTools',
+              'StreamCatTools',
+              'tmap',
+              'climateR',
+              'data.table',
+              'mapview')
+
+# this package loader avoids unloading and reloading packages 
+package_loader <- function(x) {
+  if (!requireNamespace(x, quietly = TRUE)) {
+    install.packages(x)
+  }
+  require(x, character.only = TRUE)
+}
+
+lapply(packages, package_loader)
 ```
 
 ## Grab all USGS gages
@@ -34,6 +53,8 @@ us_sf_object <- tigris::states() %>%
   filter(NAME %in% states_oi) 
 
 # Get a list of NWIS sites for all of the states
+  # what about the new NGWOS sites?
+  # what about the state specific sites?
 nwis_sites_by_state <- map(us_sf_object$STUSPS, 
                            ~{
                              discharge_sites <- whatNWISsites(stateCd = .x, parameterCd = "00060") %>% 
@@ -48,7 +69,7 @@ nwis_sites_by_state <- map(us_sf_object$STUSPS,
                              
                              return(small_enough)
                            }
-)
+) 
 
 nwis_sites <- bind_rows(nwis_sites_by_state) %>%
   st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
@@ -58,67 +79,82 @@ mapview(nwis_sites)
 
 ## Subset to gages with data since 1980 with at least 30 years of data
 
-This is a Katie choice that hasn't been run by MR of SK. But! To reduce our gages to only those with data during the time period we want (... which, I personally don't know what that is - you will need to confirm this with MR and SK) will reduce the number of watersheds you'll have to manually verify substantially. So, here I am filtering our gages to only sites that have at least 30 years worth of daily data starting in 1980. Meaning, if a gage only measured discharge before 1980, we are removing them as candidate gages. We are also removing any gages that don't have at least 30 years of data since 1980.
+This is a Katie choice that hasn't been run by MR of SK. But! To reduce our gages 
+to only those with data during the time period we want (... which, I personally 
+don't know what that is - you will need to confirm this with MR and SK) will reduce 
+the number of watersheds you'll have to manually verify substantially. So, here 
+I am filtering our gages to only sites that have at least 30 years worth of daily 
+data starting in 1980. Meaning, if a gage only measured discharge before 1980, 
+we are removing them as candidate gages. We are also removing any gages that don't 
+have at least 30 years of data since 1980.
 
 ```{r}
-  gage_meta <- dataRetrieval::whatNWISdata(siteNumber = nwis_sites$site_no, parameterCd = "00060")
+gage_meta <- dataRetrieval::whatNWISdata(siteNumber = nwis_sites$site_no, parameterCd = "00060")
+# Why is this list longer than nwis_sites?
 
-  tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
-    rvest::html_nodes('table') %>%
-    rvest::html_table()
-  
-  pcodes <- tables[[1]] %>% 
-    janitor::clean_names() %>% 
-    dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
-  
-  inventory <- gage_meta %>%
-    dplyr::left_join(pcodes,by="parm_cd") %>%
-    dplyr::select(c(site_name = station_nm,
-                    site_no,
-                    data_type_cd,
-                    site_type_cd = site_tp_cd,
-                    n_obs=count_nu,
-                    begin_date,
-                    end_date,
-                    parameter=parameter_name_description,
-                    code=parm_cd))
-  
-  site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
-  
-  table <- rvest::read_html(site_url) %>%
-    rvest::html_nodes('table') %>%
-    rvest::html_table() #%>%
-  
-  table <- rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
-    dplyr::select(site_type_cd = 1,
-                  site_type = 2)
-  
-  inventory <- left_join(inventory,table,by='site_type_cd') %>%
-    mutate(data_type=case_when(data_type_cd=="dv" ~ "Daily",
-                               data_type_cd=="uv" ~ "Unit",
-                               data_type_cd=="qw" ~ "Water Quality",
-                               data_type_cd=="gw" ~ "Groundwater Levels",
-                               data_type_cd=="iv" ~ "Unit",
-                               data_type_cd=="sv" ~ "Site Visits",
-                               data_type_cd=="pk" ~ "Peak Measurements",
-                               data_type_cd=="ad" ~ "USGS Annual Water Data Report",
-                               data_type_cd=="aw" ~ "Active Groundwater Level Network",
-                               data_type_cd=="id" ~ "Historic Instantaneous"))
+# Scrape the USGS water parameter code table 
+tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>% # fetch the webpage
+  rvest::html_nodes('table') %>% # extract the table elements from the HTML
+  rvest::html_table() # convert the HTML tables into R data frames
 
-  new_data_gages <- inventory %>%
-    filter(year(end_date) >= "1980",
-           data_type == "Daily") %>%
-    # and only sites with at least 30 years worth of data -ish
-    filter(n_obs >= 365*30)
-  
-  # Only keep gages with data during or after 1980:
-  nwis_sites <- nwis_sites %>% 
-    filter(site_no %in% new_data_gages$site_no)
+# create parm_cd (parameter code?) column in the USGS water parameter code table
+pcodes <- tables[[1]] %>% 
+  janitor::clean_names() %>% 
+  dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
+
+inventory <- gage_meta %>%
+  dplyr::left_join(pcodes,by="parm_cd") %>%
+  dplyr::select(c(site_name = station_nm,
+                  site_no,
+                  data_type_cd,
+                  site_type_cd = site_tp_cd,
+                  n_obs = count_nu,
+                  begin_date,
+                  end_date,
+                  parameter = parameter_name_description,
+                  code = parm_cd))
+
+# Scrape the USGS NWIS Site types tables 
+site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
+
+table <- rvest::read_html(site_url) %>%
+  rvest::html_nodes('table') %>%
+  rvest::html_table() 
+
+table <- rbind(table) %>%  
+  # rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
+  dplyr::select(site_type_cd = 1,
+                site_type = 2)
+
+inventory <- left_join(inventory, table, by = 'site_type_cd') %>%
+  mutate(data_type = case_when(data_type_cd == "dv" ~ "Daily",
+                               data_type_cd == "uv" ~ "Unit",
+                               data_type_cd == "qw" ~ "Water Quality",
+                               data_type_cd == "gw" ~ "Groundwater Levels",
+                               data_type_cd == "iv" ~ "Unit",
+                               data_type_cd == "sv" ~ "Site Visits",
+                               data_type_cd == "pk" ~ "Peak Measurements",
+                               data_type_cd == "ad" ~ "USGS Annual Water Data Report",
+                               data_type_cd == "aw" ~ "Active Groundwater Level Network",
+                               data_type_cd == "id" ~ "Historic Instantaneous"))
+
+new_data_gages <- inventory %>%
+  filter(year(end_date) >= "1980",
+         data_type == "Daily") %>%
+  # and only sites with at least 30 years worth of data -ish
+  filter(n_obs >= 365*30)
+
+# Only keep gages with data during or after 1980:
+nwis_sites <- nwis_sites %>% 
+  filter(site_no %in% new_data_gages$site_no)
+
+# Down from 1000 to 221 after this
 ```
 
 Grab CO DWR gages... not currently running this but here's the code for when you want to begin including those gages as well.
 
 ```{r, eval = FALSE}
+# This is where you tack on the other state specific gages
 cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
   httr::content(., as = "text", encoding = "UTF-8") %>%
   jsonlite::fromJSON() %>%
@@ -133,18 +169,31 @@ cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewa
          station_nm = stationName)
 
 # Bind CO DWR and USGS sites together
-
 nwis_sites <- nwis_sites %>% bind_rows(cdwr_sites)}
 ```
 
+TODO:
+Grab WY DWR gages
+Grab UT DWR gages
+Grab KS DWR gages
+
 ## Delineate stream gage watersheds
 
-For this analysis, we are relying on NHDPlus Version 2. We are able to delineate a stream gage's upstream contributing area (i.e., its watershed) by leveraging the NHD's network index that, for every stream feature in the NHD, identifies all other stream features upstream of it. So, our first task is to find out which NHD stream feature each gage is associated with. All stream features are given a unique ID, called a comid. Every stream feature also has an associated "catchment", or direct contributing area, with the same comid. So here, we are identifying the comid for the stream feature each gage is associated with. **DANGER: YOU WILL NEED TO CONFIRM THE APPROPRIATE FLOWLINE IS SELECTED FOR EVERY GAGE. THERE IS NO WAY TO CONFIRM THEY ARE RIGHT WITHOUT EYEBALLING THEM!**
+For this analysis, we are relying on NHDPlus Version 2. We are able to delineate 
+a stream gage's upstream contributing area (i.e., its watershed) by leveraging 
+the NHD's network index that, for every stream feature in the NHD, identifies all 
+other stream features upstream of it. So, our first task is to find out which NHD 
+stream feature each gage is associated with. All stream features are given a 
+unique ID, called a comid. Every stream feature also has an associated "catchment", 
+or direct contributing area, with the same comid. So here, we are identifying the 
+comid for the stream feature each gage is associated with. 
+**DANGER: YOU WILL NEED TO CONFIRM THE APPROPRIATE FLOWLINE IS SELECTED FOR EVERY GAGE. THERE IS NO WAY TO CONFIRM THEY ARE RIGHT WITHOUT EYEBALLING THEM!**
 
 ```{r}
 nwis_sites$comid <- NA # attempt 'get_nldi_feature()' first
 nwis_sites$comid_coords <- NA # if that doesn't work for all gages, do 'discover_nhdplus_id()'
 
+# TODO: convert these for loops to maps/mutates
 # first try to get comid using nldi ("verified" correct comid - or at least what USGS says it is)
 for(i in 1:nrow(nwis_sites)){
   try(nwis_sites$comid[i] <- get_nldi_feature(list("featureSource" = "nwissite", featureID = nwis_sites[i,]$site_pretty))$comid, silent = T)
@@ -155,14 +204,17 @@ for(i in 1:nrow(nwis_sites)){
   nwis_sites$comid_coords[i] <- discover_nhdplus_id(nwis_sites[i,])
 }
 
-# back it up if you want:
+# TODO: make sure that the data folder is properly set up for symlinks
+# back it up if you want: !!!
 # saveRDS(nwis_sites, 'data/nwis_gages_comid.RDS')
 
 # Ones where the USGS says they fall on a comid they don't technically fall on. For these, it is highly likely that you will need to go 
 # one-by-one to identify which COMID is actually appropriate to attribute to them: 
 weirdos <- nwis_sites %>% filter(comid_coords != comid)
 
-mapview(weirdos) + mapview(get_nhdplus(comid = weirdos$comid), color = "blue", layer.name = "By NLDI") + mapview(get_nhdplus(comid = weirdos$comid_coords), color = "red", layer.name = "By coordinates")
+mapview(weirdos) + 
+  mapview(get_nhdplus(comid = weirdos$comid), color = "blue", layer.name = "By NLDI") + 
+  mapview(get_nhdplus(comid = weirdos$comid_coords), color = "red", layer.name = "By coordinates")
 
 nwis_sites <- nwis_sites %>%
   # UPDATE THIS SECTION - This is where the exercise above will dictate which of the comids is most appropriate to use for each gage.
@@ -176,24 +228,26 @@ nwis_sites <- nwis_sites %>%
 
 ##### Delineate each gage's watershed
 
-Now that we have a list of our gages and their associated NHDPlus V2 stream features, we can use the NHD indexing to "crawl" upstream of each gage's flowline, then grab each flowline's catchment, and lastly dissolve those catchments into a single polygon the represents the gage's upstream contributing area (i.e., its watershed):
+Now that we have a list of our gages and their associated NHDPlus V2 stream 
+features, we can use the NHD indexing to "crawl" upstream of each gage's flowline, 
+then grab each flowline's catchment, and lastly dissolve those catchments into a 
+single polygon the represents the gage's upstream contributing area (i.e., its watershed):
 
 ```{r}
 # load in the NHD as a table. This table lists all COMIDs in CONUS and allows you to "navigate" the NHD.
 nhd <- read_csv("data/nhd_flow_network.csv")
 
 # function to delineate each gage's watershed:
+# - gut check with better termination 
 watershed_delineator <- function(site_list){
   
   # filter our master list to just the gage we are iterating over
   site <- nwis_sites %>%
     filter(site_no == site_list)
   
-  
   # use get_UT to list all comids that are upstream of our gage using the comid the
   # gage falls on:
   upstream <- nhdplusTools::get_UT(nhd, site$comid)
-  
   
   # grab all the catchments associated with the upstream comids:
   nhd_catch <- nhdplusTools::get_nhdplus(comid = upstream,
@@ -202,7 +256,7 @@ watershed_delineator <- function(site_list){
     # remove dupes (precautionary step, not likely necessary)
     dplyr::distinct(featureid, .keep_all=TRUE) %>%
     # "dissolve" all the catchments into a single polygon
-    dplyr::summarize() %>%
+    dplyr::summarize() %>% # this makes the watershed
     # remove weird hole by-products that exist if the catchment boundaries don't
     # line up perfectly:
     nngeo::st_remove_holes() %>%
@@ -230,7 +284,11 @@ mapview::mapview(watersheds)
 
 ## Grab explanatory variables
 
-Link up gages with streamcat variables. StreamCat watershed statistics are available for every stream feature in the NHDPlusV2. StreamCat uses the comid as the identifier so we can link up information that way. A complete list of available variables you can pull is found in the vars table below. I am NOT pulling in all the available info that you can because these soooo much!
+Link up gages with streamcat variables. StreamCat watershed statistics are available 
+for every stream feature in the NHDPlusV2. StreamCat uses the comid as the identifier 
+so we can link up information that way. A complete list of available variables you 
+can pull is found in the vars table below. I am NOT pulling in all the available 
+info that you can because there is so much!
 
 ```{r}
 # Grab a list of all available streamcat variables:
@@ -244,43 +302,44 @@ vars <- read_csv("data/StreamCatVars.csv")
 
 # This is what's available on StreamCat related to lithology. Likely not identical to what
 # was used by Abby but hopefully good swap:
-lithology_vars <- c("PctAlkIntruVol", "PctWater",
-                    "PctSilicic",      "PctSalLake",    
-                    "PctNonCarbResid", "PctHydric",      
-                    "PctGlacTilLoam",  "PctGlacTilCrs",  
-                    "PctGlacTilClay",  "PctGlacLakeFine",
-                    "PctGlacLakeCrs",  "PctExtruVol",   
-                    "PctEolFine",      "PctEolCrs",      
-                    "PctColluvSed",    "PctCoastCrs",    
-                    "PctCarbResid",    "PctAlluvCoast")
+lithology_vars <- c("pctalkintruvol", "pctwater",
+                    "pctsilicic", "pctsallake",    
+                    "pctnoncarbresid", "pcthydric",      
+                    "pctglactilloam", "pctglactilcrs",  
+                    "pctglactilclay", "pctglaclakefine",
+                    "pctglaclakecrs", "pctextruvol",   
+                    "pcteolfine", "pcteolcrs",      
+                    "pctcolluvsed", "pctcoastcrs",    
+                    "pctcarbresid")
+                    # "pctalluvocoast" is giving me issues
 
 # Urban cover (add all together to get percent of total urban cover): 
 # Many available years. Which do we want to use? For now using 2011:
-urban_cover <- c("PctUrbOp2019", "PctUrbMd2019", "PctUrbLo2019", "PctUrbHi2019")
+urban_cover <- c("pcturbop2019", "pcturbmd2019", "pcturblo2019", "pcturbhi2019")
 
 # PRISM mean precip for 1981-2010 OR 1991-2020
-prism_precip <- c("Precip8110", "Precip9120")
+prism_precip <- c("precip8110", "precip9120")
 
 # These are all the variables Fred was interested in for describing flow
 # in his work. Likely a good starting point for our needs, too. 
-fred_vars <- c("CanalDens", 
+fred_vars <- c("canaldens", 
                # BFI
-               "BFI", 
+               "bfi", 
                #NLCD 2019
-               "PctOw2019", "PctIce2019", "PctUrbOp2019", "PctUrbLo2019", "PctUrbMd2019", "PctUrbHi2019",
-               "PctBl2019", "PctDecid2019", "PctConif2019", "PctMxFst2019", "PctShrb2019",  "PctGrs2019", 
-               "PctHay2019", "PctCrop2019",  "PctWdWet2019", "PctHbWet2019", 
+               "pctow2019", "pctice2019", "pcturbop2019", "pcturblo2019", "pcturbmd2019", "pcturbhi2019",
+               "pctbl2019", "pctdecid2019", "pctconif2019", "pctmxfst2019", "pctshrb2019", "pctgrs2019",
+               "pcthay2019", "pctcrop2019", "pctwdwet2019", "pcthbwet2019",
                # Dam Info
-               "DamDens", "DamNIDStor", "DamNrmStor",
+              "damdens", "damnidstor", "damnrmstor",
                # Elevation
-               "Elev", 
+               "elev", 
                # Impervious Surfaces across a bunch of years:
-               "PctImp2006", "PctImp2008", "PctImp2011", "PctImp2001",
-               "PctImp2013", "PctImp2019", "PctImp2016", "PctImp2004",
+               "pctimp2006", "pctimp2008", "pctimp2011", "pctimp2001",
+               "pctimp2013", "pctimp2019", "pctimp2016", "pctimp2004",
                # PRISM 1991-2020
-               "Precip9120", "Tmax9120", "Tmean9120", "Tmin9120",
+               "precip9120", "tmax9120", "tmean9120", "tmin9120",
                # STATSGO variables:
-               "Clay", "Sand", "Silt", "WtDep", "Om", "Perm", "RckDep")
+               "clay", "sand", "wtdep", "om", "perm", "rckdep") # "silt" is giving me issues
 
 streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(c(lithology_vars, urban_cover, prism_precip, fred_vars), collapse = ","),
                                       aoi = 'watershed', 
@@ -288,19 +347,23 @@ streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(c(lithology_vars, u
   # remove variables we don't particularly care about that get returned:
   select(-contains("AREASQKM"))
 
+# combine the watershed polygons with the streamcat data
 watersheds_streamcat <- watersheds %>%
-  left_join(., streamcat_vars, by = c("comid" = "COMID")) %>%
-  mutate(PCTURB2019WS = PCTURBHI2019WS + PCTURBMD2019WS + PCTURBLO2019WS + PCTURBOP2019WS)
+  left_join(., streamcat_vars, by = "comid") %>%
+  mutate(pcturb2019ws = pcturbhi2019ws + pcturbmd2019ws + pcturblo2019ws + pcturbop2019ws)
 ```
 
 ## Find reference quality gages:
 
-Using the StreamCat variables, we can drop any gages who have characteristics that make them unsuitable as reference gages. For example, we can remove any gages whose watersheds have \>= 10% urban landcover and watersheds that have dam storage densities larger than 100 megaliters/square kilometer:
+Using the StreamCat variables, we can drop any gages who have characteristics 
+that make them unsuitable as reference gages. For example, we can remove any 
+gages whose watersheds have \>= 10% urban landcover and watersheds that have 
+dam storage densities larger than 100 megaliters/square kilometer:
 
 ```{r}
 ref_watersheds <- watersheds_streamcat %>%
-  filter(PCTURB2019WS < 10) %>%
-  filter(DAMNIDSTORWS < 100000)
+  filter(pcturb2019ws < 10) %>%
+  filter(damnidstorws < 100000)
 # REMOVE THIS STEP ONCE "GOOD" WATERSHEDS HAVE BEEN IDENTIFIED:
 # But for now, this is a quick and lazy way of getting rid of watersheds
 # we know were delineated incorrectly. They were delineated incorrectly
@@ -312,7 +375,14 @@ ref_watersheds <- ref_watersheds %>% mutate(area = sf::st_area(ref_watersheds)) 
   filter(as.numeric(area) <= 1.6e+9)
 ```
 
-And, we can drop any gages whose watersheds contain a transbasin diversion. We identify watersheds that have a transbasin diversion by grabbing NHD HR flowlines features that intersect the watershed. We are using NHD HR instead of NHDPlusV2 because the NHDHR has flowline features that are identified as being canals, ditches, etc. With that info, we identify watersheds where any of those "unnatural" features cross over the watershed boundary. If a canal/ditch crosses over a watershed boundary, that means that water is being moved in or out of the watershed unnaturally.
+And, we can drop any gages whose watersheds contain a transbasin diversion. We 
+identify watersheds that have a transbasin diversion by grabbing NHD HR flowlines 
+features that intersect the watershed. We are using NHD HR instead of NHDPlusV2 
+because the NHDHR has flowline features that are identified as being canals, 
+ditches, etc. With that info, we identify watersheds where any of those "unnatural" 
+features cross over the watershed boundary. If a canal/ditch crosses over a 
+watershed boundary, that means that water is being moved in or out of the 
+watershed unnaturally.
 
 ```{r}
 fetch_flowlines <- function(site_list){
@@ -330,22 +400,22 @@ fetch_flowlines <- function(site_list){
   # use bbox to return associated flowlines
   geospatial_aoi <- site %>% 
     # add a buffer around the watershed for visualization later on
-     st_buffer(1000) %>% 
+    st_buffer(1000) %>% 
     # Convert sf object to sfc object (required for downloading from the map server)
     st_as_sfc(.)
   
   nhd_flowlines <- vector("list", length = length(geospatial_aoi))
   
-    tryCatch({
-      nhd_flowlines <- arcgislayers::arc_select(nhd_hr_flowlines,
-                                                     # where = query,
-                                                     filter_geom = geospatial_aoi,
-                                                     crs = st_crs(geospatial_aoi)) %>% 
-        st_make_valid()},
-      error = function(e){
-        cat("Index ", i, " from input data failed.")
-      }) 
-
+  tryCatch({
+    nhd_flowlines <- arcgislayers::arc_select(nhd_hr_flowlines,
+                                              # where = query,
+                                              filter_geom = geospatial_aoi,
+                                              crs = st_crs(geospatial_aoi)) %>% 
+      st_make_valid()},
+    error = function(e){
+      cat("Index ", i, " from input data failed.")
+    }) 
+  
   nhd_flowlines <- nhd_flowlines %>% 
     keep(~!is.null(.))
   
@@ -353,15 +423,15 @@ fetch_flowlines <- function(site_list){
         dplyr::bind_rows() %>%
         dplyr::distinct() %>%
         mutate(#natural = ifelse(ftype == 460, T, F),
-               flowline_type = case_when(ftype == 460 ~ "natural",
-                                         ftype == 558 ~ "artificial path",
-                                         ftype == 468 ~ "drainageway",
-                                         ftype == 336 ~ "canal ditch",
-                                         ftype == 566 ~ "coastline",
-                                         ftype == 334 ~ "connector",
-                                         ftype == 428 ~ "pipeline",
-                                         ftype == 420 ~ "underground conduit",
-                                         .default = "unnatural")), 
+          flowline_type = case_when(ftype == 460 ~ "natural",
+                                    ftype == 558 ~ "artificial path",
+                                    ftype == 468 ~ "drainageway",
+                                    ftype == 336 ~ "canal ditch",
+                                    ftype == 566 ~ "coastline",
+                                    ftype == 334 ~ "connector",
+                                    ftype == 428 ~ "pipeline",
+                                    ftype == 420 ~ "underground conduit",
+                                    .default = "unnatural")), 
       silent = TRUE)
   
   
@@ -381,65 +451,65 @@ all_flowlines <- ref_watersheds$site_no %>%
 # in fetchNHD_flowlines, we have categorized each flowline as being natural or unnatural.
 # So, we can subset the flowlines to just the unnatural ones. 
 all_flowlines_unnatural <- all_flowlines %>%
-    filter(flowline_type != "natural") 
+  filter(flowline_type != "natural") 
 
 transbasin_finder <- function(site_list){
   
-# filter our master list to just the gage's watershed we are iterating over
+  # filter our master list to just the gage's watershed we are iterating over
   site <- ref_watersheds %>%
     filter(site_no == site_list)
   
-    flowlines <- readRDS(paste0("data/flowlines/", site$site_no, ".RDS"))
-
-flowlines_unnatural <- flowlines %>%
+  flowlines <- readRDS(paste0("data/flowlines/", site$site_no, ".RDS"))
+  
+  flowlines_unnatural <- flowlines %>%
     filter(flowline_type != "natural") 
   
   # For linestring transformation step to work, need the watershed to be a polygon object:
-    if (st_geometry_type(site) != "POLYGON") {
+  if (st_geometry_type(site) != "POLYGON") {
     # If not, cast to a Polygon... which will "explode" it into multiple. 
-      # This is a rare thing... I think...
+    # This is a rare thing... I think...
     site <- st_cast(site, "POLYGON") 
   }
   
   polyline <-  site %>% st_cast("LINESTRING")
-
+  
   crossovers <- flowlines_unnatural %>%
     .[polyline,] %>%
     nrow()
   
-# Some watersheds are multipolygons and therefore need to be put back together here:
+  # Some watersheds are multipolygons and therefore need to be put back together here:
   site <- site %>% group_by(site_no, comid) %>% summarize() %>%
     mutate(transbasin = ifelse(crossovers > 0, "TRANSBASIN DIVERSION", "NATURAL")) 
-
+  
   # Extract the bounding box of the site_data
-bbox_site <- st_bbox(site)
-
-# Create the ggplot map, zoomed to the bounding box of site_data
-gg_map <- ggplot() +
-  # Plot the site data
-  geom_sf(data = site, color = "black", fill = "white", size = 1) + 
+  bbox_site <- st_bbox(site)
+  
+  # Create the ggplot map, zoomed to the bounding box of site_data
+  gg_map <- ggplot() +
     # Plot the site data
-  geom_sf(data = filter(nwis_sites, site_no == site$site_no), color = "lightblue", size = 5.5) + 
-  # Plot the natural flowlines in blue
-  geom_sf(data = flowlines, color = "blue", size = 0.5) + 
+    geom_sf(data = site, color = "black", fill = "white", size = 1) + 
+    # Plot the site data
+    geom_sf(data = filter(nwis_sites, site_no == site$site_no), color = "lightblue", size = 5.5) + 
+    # Plot the natural flowlines in blue
+    geom_sf(data = flowlines, color = "blue", size = 0.5) + 
     # Plot the unnatural flowlines in red
-  geom_sf(data = flowlines_unnatural, color = "red", size = 2) + 
-  # Set the xlim and ylim based on the bounding box of site_data
-  xlim(bbox_site["xmin"], bbox_site["xmax"]) +
-  ylim(bbox_site["ymin"], bbox_site["ymax"]) +
-  coord_sf() + 
-  theme_void() +
-  labs(title = paste0(site$site_no, " ", site$transbasin)) +  
-  theme(
-    plot.title = element_text(size = 14, hjust = 0.5),  
-    panel.grid.major = element_blank(), 
-    panel.grid.minor = element_blank()
-  )
-
-# Save the map as an image
-ggsave(gg_map, filename = paste0("data/transbasin_confirm/", site$transbasin, "_", site$site_no, ".png"))
-
-print(site$site_no)
+    geom_sf(data = flowlines_unnatural, color = "red", size = 2) + 
+    # Set the xlim and ylim based on the bounding box of site_data
+    xlim(bbox_site["xmin"], bbox_site["xmax"]) +
+    ylim(bbox_site["ymin"], bbox_site["ymax"]) +
+    coord_sf() + 
+    theme_void() +
+    labs(title = paste0(site$site_no, " ", site$transbasin)) +  
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),  
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank()
+    )
+  
+  # Save the map as an image
+  ggsave(gg_map, filename = paste0("data/transbasin_confirm/", site$transbasin, "_", site$site_no, ".png"))
+  
+  print(site$site_no)
   return(site)
   
 }
@@ -448,7 +518,6 @@ watersheds_div <- ref_watersheds$site_no %>%
   map(~transbasin_finder(.)) %>%
   bind_rows() %>%
   st_make_valid()
-
 ```
 
 Reduce our reference gages to only gages without a transbasin diversion:
@@ -648,6 +717,8 @@ watershed_climate <- get_climate_historic(sf = ref_watersheds,
 
 Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is annual snow persistence data from 2001-2020. Using the {terra} package, I get the area-weighted annual average snow persistence value for each watershed, then average each year's data together to get a single time- and area-weighted average for each watershed.
 
+Q: This is not the MODIS data set?
+
 ```{r}
 # sp_preview <- rast("data/snow_persistence_hammond/MOD10A2_SCI_2020.tif")
 # 
@@ -681,3 +752,6 @@ watershed_sp <- as_tibble(mean_sp) %>%
   group_by(site_no, comid, transbasin) %>% 
   summarize(mean_sp_2001_2020 = mean(value))
 ```
+
+get the list of watersheds to start manually verifying.
+add state specific gages
