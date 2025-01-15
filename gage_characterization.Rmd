@@ -29,7 +29,8 @@ packages <- c('tidyverse',
               'tmap',
               'climateR',
               'data.table',
-              'mapview')
+              'mapview',
+              'here')
 
 # this package loader avoids unloading and reloading packages 
 package_loader <- function(x) {
@@ -121,8 +122,7 @@ table <- rvest::read_html(site_url) %>%
   rvest::html_nodes('table') %>%
   rvest::html_table() 
 
-table <- rbind(table) %>%  
-  # rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
+table <- rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
   dplyr::select(site_type_cd = 1,
                 site_type = 2)
 
@@ -384,6 +384,7 @@ features cross over the watershed boundary. If a canal/ditch crosses over a
 watershed boundary, that means that water is being moved in or out of the 
 watershed unnaturally.
 
+This function takes a long time.
 ```{r}
 fetch_flowlines <- function(site_list){
   
@@ -447,19 +448,28 @@ all_flowlines <- ref_watersheds$site_no %>%
   map(~fetch_flowlines(.)) %>%
   bind_rows() %>%
   distinct()
+```
 
+```{r}
 # in fetchNHD_flowlines, we have categorized each flowline as being natural or unnatural.
 # So, we can subset the flowlines to just the unnatural ones. 
 all_flowlines_unnatural <- all_flowlines %>%
   filter(flowline_type != "natural") 
 
-transbasin_finder <- function(site_list){
+# this is where it errored out
+transbasin_finder <- function(site_list){ # site list is inaccurate, should be site
   
   # filter our master list to just the gage's watershed we are iterating over
   site <- ref_watersheds %>%
     filter(site_no == site_list)
   
-  flowlines <- readRDS(paste0("data/flowlines/", site$site_no, ".RDS"))
+  flowlines <- read_rds(here("data", "flowlines", paste0(site$site_no, ".RDS"))) 
+  
+  # if there are no flow lines return NULL
+  if (length(flowlines) == 0) {
+    print(paste(site$site_no, "has an empty list"))
+    return(NULL)
+  }
   
   flowlines_unnatural <- flowlines %>%
     filter(flowline_type != "natural") 
@@ -509,13 +519,14 @@ transbasin_finder <- function(site_list){
   # Save the map as an image
   ggsave(gg_map, filename = paste0("data/transbasin_confirm/", site$transbasin, "_", site$site_no, ".png"))
   
-  print(site$site_no)
+  print(paste0(site$site_no, " was successful."))
   return(site)
   
 }
 
 watersheds_div <- ref_watersheds$site_no %>%
   map(~transbasin_finder(.)) %>%
+  compact() %>% 
   bind_rows() %>%
   st_make_valid()
 ```
@@ -525,13 +536,19 @@ Reduce our reference gages to only gages without a transbasin diversion:
 ```{r}
 ref_watersheds <- watersheds_div %>%
   filter(transbasin == "NATURAL")
+
+# only 35 reference watersheds???
 ```
 
 ### Grab other variables not found in stream cat:
 
 #### Dominant watershed aspect
 
-Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there's an easier approach than what I'm presenting here. I grab raw elevation DEMs, get the aspect (in degrees) for each grid cell, then convert those raw aspects (in degrees) into categorical N, E, S, W cardinal directions as displayed in this image below:
+Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there's 
+an easier approach than what I'm presenting here. I grab raw elevation DEMs, get 
+the aspect (in degrees) for each grid cell, then convert those raw aspects 
+(in degrees) into categorical N, E, S, W cardinal directions as displayed in 
+this image below:
 
 ![](data/compassrose.jpg)
 
@@ -589,7 +606,12 @@ watershed_aspects <- ref_watersheds$site_no %>%
 
 #### GridMET climate data
 
-gridMET is DAILY gridded climate data. I am pulling in daily data for all grid cells that overlap each watershed for days in 2001-2020. Namely, I'm downloading max temperature, min temperature, PET, and precipitation. Then, I'm averaging that data across the watershed to get a single, average value for the watershed. See the function `get_climate_historic()` if you want to see how the raw gridMET data is pulled in.
+gridMET is DAILY gridded climate data. I am pulling in daily data for all grid 
+cells that overlap each watershed for days in 2001-2020. Namely, I'm downloading 
+max temperature, min temperature, PET, and precipitation. Then, I'm averaging 
+that data across the watershed to get a single, average value for the watershed. 
+See the function `get_climate_historic()` if you want to see how the raw 
+gridMET data is pulled in.
 
 ```{r}
 
@@ -695,7 +717,9 @@ get_climate_historic <- function(sf,
     
     return(all_climate_data)
     
-  } else {stop("Your sf feature is neither a polygon nor point feature, or it needs to be made valid.")}
+  } else {
+    stop("Your sf feature is neither a polygon nor point feature, or it needs to be made valid.")
+    }
   
 }
 
@@ -715,7 +739,11 @@ watershed_climate <- get_climate_historic(sf = ref_watersheds,
 
 #### Snow persistence
 
-Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is annual snow persistence data from 2001-2020. Using the {terra} package, I get the area-weighted annual average snow persistence value for each watershed, then average each year's data together to get a single time- and area-weighted average for each watershed.
+Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is 
+annual snow persistence data from 2001-2020. Using the {terra} package, I get 
+the area-weighted annual average snow persistence value for each watershed, 
+then average each year's data together to get a single time- and area-weighted 
+average for each watershed.
 
 Q: This is not the MODIS data set?
 
