@@ -48,7 +48,7 @@ lapply(packages, package_loader)
 Using the dataRetrieval package in R, locate all USGS stream gages under 1500 square kilometers that measure discharge.
 
 ```{r}
-states_oi <- c("Colorado")#, "Wyoming", "Utah", "Kansas")
+states_oi <- c("Colorado", "Wyoming", "Utah", "Kansas")
 
 us_sf_object <- tigris::states() %>% 
   filter(NAME %in% states_oi) 
@@ -66,7 +66,8 @@ nwis_sites_by_state <- map(us_sf_object$STUSPS,
                                mutate(drain_area_km = drain_area_va *  2.58999) %>%  
                                filter(drain_area_km <= 1500) %>%
                                # For future tracking with the NLDI:
-                               mutate(site_pretty=paste0("USGS-",site_no))
+                               mutate(site_pretty=paste0("USGS-",site_no),
+                                      STUSPS = .x)
                              
                              return(small_enough)
                            }
@@ -154,22 +155,22 @@ nwis_sites <- nwis_sites %>%
 Grab CO DWR gages... not currently running this but here's the code for when you want to begin including those gages as well.
 
 ```{r, eval = FALSE}
-# This is where you tack on the other state specific gages
-cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
-  httr::content(., as = "text", encoding = "UTF-8") %>%
-  jsonlite::fromJSON() %>%
-  .[["ResultList"]] %>%
-  filter(year(endDate) >= "1980") %>%
-  filter(is.na(usgsSiteId)) %>%
-  filter(!is.na(longitude) & !is.na(latitude)) %>%
-  st_as_sf(coords = c("longitude", "latitude"), crs = 4269) %>%
-  # Obnoxiously station type cannot be accessed on API only GUI
-  filter(abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>%
-  select(site_no = abbrev,
-         station_nm = stationName)
-
-# Bind CO DWR and USGS sites together
-nwis_sites <- nwis_sites %>% bind_rows(cdwr_sites)}
+# # This is where you tack on the other state specific gages
+# cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
+#   httr::content(., as = "text", encoding = "UTF-8") %>%
+#   jsonlite::fromJSON() %>%
+#   .[["ResultList"]] %>%
+#   filter(year(endDate) >= "1980") %>%
+#   filter(is.na(usgsSiteId)) %>%
+#   filter(!is.na(longitude) & !is.na(latitude)) %>%
+#   st_as_sf(coords = c("longitude", "latitude"), crs = 4269) %>%
+#   # Obnoxiously station type cannot be accessed on API only GUI
+#   filter(abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>%
+#   select(site_no = abbrev,
+#          station_nm = stationName)
+# 
+# # Bind CO DWR and USGS sites together
+# nwis_sites <- nwis_sites %>% bind_rows(cdwr_sites)}
 ```
 
 TODO:
@@ -221,7 +222,7 @@ nwis_sites <- nwis_sites %>%
   # For now, just removing the weirdos.
   mutate(comid_new = ifelse(is.na(comid), comid_coords, comid)) %>%
   filter(comid_coords == comid) %>%
-  select(site_no, station_nm, comid = comid_new) %>%
+  select(STUSPS, site_no, station_nm, comid = comid_new) %>%
   mutate(comid = as.numeric(comid)) 
   
 ```
@@ -235,7 +236,7 @@ single polygon the represents the gage's upstream contributing area (i.e., its w
 
 ```{r}
 # load in the NHD as a table. This table lists all COMIDs in CONUS and allows you to "navigate" the NHD.
-nhd <- read_csv("data/nhd_flow_network.csv")
+nhd <- read_csv(here("data", "nhd_flow_network.csv"))
 
 # function to delineate each gage's watershed:
 # - gut check with better termination 
@@ -260,11 +261,13 @@ watershed_delineator <- function(site_list){
     # remove weird hole by-products that exist if the catchment boundaries don't
     # line up perfectly:
     nngeo::st_remove_holes() %>%
-    # tack on the site name and comid to the watershed
-    dplyr::mutate(site_no = site$site_no,
+    # tack on the state, site name, and comid to the watershed
+    dplyr::mutate(state = site$STUSPS,
+                  site_no = site$site_no,
                   comid = site$comid)
   # back it up:
-  saveRDS(nhd_catch, paste0("data/watersheds/", site$site_no, ".RDS"))
+  saveRDS(nhd_catch, here("data", "watersheds", paste0(site$STUSPS, "_", site$site_no, ".RDS")))
+  # saveRDS(nhd_catch, paste0("data/watersheds/", site$site_no, ".RDS"))
   
   print(paste0(site$station_nm, " delineated!"))
   
@@ -435,8 +438,8 @@ fetch_flowlines <- function(site_list){
                                     .default = "unnatural")), 
       silent = TRUE)
   
-  
-  saveRDS(nhd_flowlines, paste0("data/flowlines/", site_list, ".RDS"))
+  saveRDS(nhd_flowlines, here("data", "flowlines", paste0(site$state, "_", site$site_no,".RDS")))
+  # saveRDS(nhd_flowlines, paste0("data/flowlines/", site_list, ".RDS"))
   
   print(paste0(site_list, " done!"))
   
@@ -456,8 +459,7 @@ all_flowlines <- ref_watersheds$site_no %>%
 all_flowlines_unnatural <- all_flowlines %>%
   filter(flowline_type != "natural") 
 
-# this is where it errored out
-transbasin_finder <- function(site_list){ # site list is inaccurate, should be site
+transbasin_finder <- function(site_list){ 
   
   # filter our master list to just the gage's watershed we are iterating over
   site <- ref_watersheds %>%
@@ -517,7 +519,7 @@ transbasin_finder <- function(site_list){ # site list is inaccurate, should be s
     )
   
   # Save the map as an image
-  ggsave(gg_map, filename = paste0("data/transbasin_confirm/", site$transbasin, "_", site$site_no, ".png"))
+  ggsave(gg_map, filename = here("data", "transbasin_confirm", paste0(site$transbasin, "_", site$state, "_", site$site_no, ".png")))
   
   print(paste0(site$site_no, " was successful."))
   return(site)
@@ -632,7 +634,7 @@ get_climate_historic <- function(sf,
       
       aoi <- sf[i,]
       
-      print(paste0('Downloading GridMET for ', aoi$join_index, "."))
+      print(paste0('Downloading GridMET for ', aoi$state, "_", aoi$join_index, "."))
       
       clim <- climateR::getGridMET(AOI = aoi,
                                    varname = vars,
@@ -681,7 +683,7 @@ get_climate_historic <- function(sf,
                         join_index = aoi$join_index) %>%
           dplyr::select(-c("tmmx", "tmmn", "pr", "pet"))
         
-        saveRDS(all_climate_data[[i]], paste0("data/climate/", aoi$join_index, ".RDS"))
+        saveRDS(all_climate_data[[i]], here("data", "climate", paste0(aoi$state, "_", aoi$join_index, ".RDS")))
         
       } else {
         
@@ -704,7 +706,7 @@ get_climate_historic <- function(sf,
                         join_index = aoi$join_index) %>%
           dplyr::select(-c("tmmx", "tmmn", "pr", "pet"))
         
-        saveRDS(all_climate_data[[i]], paste0("data/climate/", aoi$join_index, ".RDS"))
+        saveRDS(all_climate_data[[i]], here("data", "climate", paste0(aoi$state, "_", aoi$join_index, ".RDS")))
         
       }
     }
@@ -755,7 +757,7 @@ Q: This is not the MODIS data set?
 #   tm_layout(frame = FALSE)
 
 # load all the .tif files into a list
-tif_files <- list.files("data/snow_persistence_hammond/", pattern = "\\.tif$", full.names = TRUE)
+tif_files <- list.files(here("data", "snow_persistence_hammond"), pattern = "\\.tif$", full.names = TRUE)
 
 # stack the snow persistence .tif files into a single raster stack
 raster_stack <- rast(tif_files)
@@ -777,7 +779,7 @@ watershed_sp <- as_tibble(mean_sp) %>%
   bind_cols(st_drop_geometry(ref_watersheds)) %>%
   select(-ID) %>%
   pivot_longer(cols = c(contains("MOD"))) %>%
-  group_by(site_no, comid, transbasin) %>% 
+  group_by(state, site_no, comid, transbasin) %>% 
   summarize(mean_sp_2001_2020 = mean(value))
 ```
 
