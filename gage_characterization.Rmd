@@ -465,7 +465,7 @@ transbasin_finder <- function(site_list){
   site <- ref_watersheds %>%
     filter(site_no == site_list)
   
-  flowlines <- read_rds(here("data", "flowlines", paste0(site$site_no, ".RDS"))) 
+  flowlines <- read_rds(here("data", "flowlines", paste0(site$state, "_", site$site_no, ".RDS"))) 
   
   # if there are no flow lines return NULL
   if (length(flowlines) == 0) {
@@ -633,7 +633,7 @@ get_climate_historic <- function(sf,
     for (i in 1:nrow(sf)) {
       
       aoi <- sf[i,]
-      
+      browser()
       print(paste0('Downloading GridMET for ', aoi$state, "_", aoi$join_index, "."))
       
       clim <- climateR::getGridMET(AOI = aoi,
@@ -737,6 +737,10 @@ watershed_climate <- get_climate_historic(sf = ref_watersheds,
             ppt_mm_2001_2020 = mean(ppt_mm, na.rm = TRUE), 
             tmax_C_2001_2020 = mean(tmax_C, na.rm = TRUE), 
             tmin_C_2001_2020 = mean(tmin_C, na.rm = TRUE))
+```
+```{r}
+# rename the climate data in the climate folder
+
 ```
 
 #### Snow persistence
