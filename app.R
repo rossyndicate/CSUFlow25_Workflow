@@ -2,13 +2,20 @@ library(shiny)
 library(bslib)
 library(magick)
 library(shinyjs)
+library(here)
+library(tidyverse)
+library(base64enc)
 
 # Create directories if they don't exist
 dirs <- c("passed", "failed", "skipped")
-sapply(dirs, function(d) if (!dir.exists(d)) dir.create(d))
+walk(dirs, function(folder){
+  if (!dir.exists(here("data", "confirmed_watersheds", folder))){
+    dir.create(here("data", "confirmed_watersheds", folder))
+  }
+})
 
 ui <- page_sidebar(
-  title = "Image Review Tool",
+  title = "Watershed Review Tool",
   sidebar = sidebar(
     fileInput("folder", "Choose Images", multiple = TRUE,
               accept = c('image/png', 'image/jpeg', 'image/jpg')),
@@ -19,9 +26,7 @@ ui <- page_sidebar(
       br(), br(),
       actionButton("fail", "Fail", class = "btn-danger", width = "100%"),
       br(), br(),
-      actionButton("skip", "Skip", class = "btn-warning", width = "100%"),
-      hr(),
-      sliderInput("zoom", "Zoom Level", min = 0.1, max = 3, value = 1, step = 0.1)
+      actionButton("skip", "Skip", class = "btn-warning", width = "100%")
     )
   ),
   
@@ -34,7 +39,7 @@ ui <- page_sidebar(
     )
   ),
   
-  # Add necessary JavaScript for drag functionality
+  # Add necessary JavaScript for drag and zoom functionality
   tags$head(
     tags$script("
       var dragItem = null;
@@ -42,6 +47,7 @@ ui <- page_sidebar(
       var dragStartY = 0;
       var imageX = 0;
       var imageY = 0;
+      var currentZoom = 1;
 
       function handleDragStart(e) {
         dragItem = e.target;
@@ -55,13 +61,23 @@ ui <- page_sidebar(
         if (!dragItem) return;
         imageX = e.clientX - dragStartX;
         imageY = e.clientY - dragStartY;
-        dragItem.style.transform = 'translate(' + imageX + 'px, ' + imageY + 'px)';
+        dragItem.style.transform = `translate(${imageX}px, ${imageY}px) scale(${currentZoom})`;
       }
 
       function handleDragEnd() {
         dragItem = null;
         document.removeEventListener('mousemove', handleDrag);
         document.removeEventListener('mouseup', handleDragEnd);
+      }
+
+      function handleWheel(e) {
+        e.preventDefault();
+        const delta = e.deltaY * -0.001;
+        currentZoom = Math.min(Math.max(0.1, currentZoom + delta), 3);
+        
+        // Update the image scale
+        const img = e.target;
+        img.style.transform = `translate(${imageX}px, ${imageY}px) scale(${currentZoom})`;
       }
     ")
   )
@@ -86,12 +102,19 @@ server <- function(input, output, session) {
   output$image_container <- renderUI({
     req(rv$current_image)
     
+    # create a data URI for the image
+    img_data <- base64enc::dataURI(
+      file = rv$current_image$datapath,
+      mime = rv$current_image$type
+    )
+    
     tags$div(
       style = "overflow: hidden; position: relative; height: 600px;",
       tags$img(
-        src = rv$current_image$datapath,
-        style = sprintf("cursor: move; transform-origin: center; scale: %s;", input$zoom),
+        src = img_data,
+        style = "cursor: move; transform-origin: center;",
         onmousedown = "handleDragStart(event)",
+        onwheel = "handleWheel(event)",
         height = "100%"
       )
     )
@@ -101,18 +124,15 @@ server <- function(input, output, session) {
   move_and_next <- function(decision) {
     req(rv$current_image)
     
-    # Create target directory if it doesn't exist
-    target_dir <- file.path(getwd(), decision)
+    target_dir <- file.path(here("data", "confirmed_watersheds", decision))
     if (!dir.exists(target_dir)) dir.create(target_dir)
     
-    # Move file to appropriate folder
     file.copy(
       rv$current_image$datapath,
       file.path(target_dir, rv$current_image$name),
       overwrite = TRUE
     )
     
-    # Move to next image
     rv$image_index <- rv$image_index + 1
     if (rv$image_index <= nrow(rv$images)) {
       rv$current_image <- rv$images[rv$image_index, ]
