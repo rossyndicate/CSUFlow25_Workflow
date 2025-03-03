@@ -49,6 +49,7 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 
+
 # Ignore Jetbrains settings file
 .idea/
 
@@ -56,3 +57,7 @@ rsconnect/
 CObasins_flow.csv
 daymet_2000-01-01_2024-01-01.csv
 gridmet_2000-01-01_2024-11-15.csv
+
+# Data folder
+data/
+
