@@ -49,5 +49,10 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 
-# Data folder
+# Custom folder ignores
+
+## Data folder
 data/
+
+## Documentation
+documentation/*.html

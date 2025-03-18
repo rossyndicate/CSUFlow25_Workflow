@@ -1,0 +1,1305 @@
+---
+title: "Variable Selection"
+output: 
+  html_document:
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+library(here)
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, include = FALSE, warning = FALSE}
+# To install StreamCatTools:
+# library(remotes)
+# install_github("USEPA/StreamCatTools", build_vignettes=FALSE)
+
+# To install climateR:
+# library(remotes)
+# remotes::install_github("mikejohnson51/AOI") # suggested!
+# remotes::install_github("mikejohnson51/climateR")
+
+# To install ggsankey:
+# library(remotes)
+# remotes::install_github("davidsjoberg/ggsankey")
+# Load necessary libraries
+
+packages <- c('tidyverse',
+              'sf',
+              'terra',
+              'elevatr', 
+              'dataRetrieval',
+              'nhdplusTools',
+              'StreamCatTools',
+              'tmap',
+              'climateR',
+              'data.table',
+              'mapview',
+              'here',
+              'furrr',
+              'nngeo',
+              'retry',
+              'units',
+              'FedData',
+              'knitr',
+              'DT',
+              'AOI',
+              'ggsankey',
+              'whitebox',
+              'viridis',
+              'cowplot',
+              'patchwork')
+
+# this package loader avoids unloading and reloading packages 
+package_loader <- function(x) {
+  if (!requireNamespace(x, quietly = TRUE)) {
+    install.packages(x)
+  }
+  require(x, character.only = TRUE)
+}
+
+lapply(packages, package_loader)
+```
+
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_hydrology_topography.png"))
+```
+# Previous Model Predictors
+
+* Model predictors included:
+   * Climate variables:
+      * Snow Persistence (SP): Quantifies average annual snow cover duration
+      * Precipitation: Total water input to the watershed system
+      * Potential Evapotranspiration: Maximum possible water loss through evaporation and plant transpiration
+   * Topographic variables:
+      * Slope: Impacts water movement velocity and erosion potential
+      * Aspect: Direction of slope face, affecting solar radiation and moisture retention
+      * Geology: Underlying rock types influencing groundwater movement and chemistry
+      * Hydrologic Region: Regional classification based on flow regime characteristics
+
+```{r, echo=FALSE}
+final_variable_selection <- read_rds(here("data", "streamcat_aspect_gridmet_sp_whitebox_variables.rds"))
+
+# We want to use variables that have meaningful information, so we remove those 
+# columns that have less than 90% available data
+clean_final_variable_selection <- final_variable_selection %>%
+  select(where(function(col) {
+    # Check for NA percentage
+    na_pct <- mean(is.na(col))
+    
+    # Check for "zero-like" values based on column type
+    if(is.numeric(col)) {
+      zero_pct <- mean(col == 0, na.rm = TRUE)
+    } else if(is.character(col)) {
+      zero_pct <- mean(col == "" | col == "0", na.rm = TRUE)
+    } else if(is.logical(col)) {
+      zero_pct <- mean(col == FALSE, na.rm = TRUE)
+    } else {
+      zero_pct <- 0  # For other types
+    }
+    
+    # Keep column if both NA and zero percentages are <= 0.10 (meaning at least 90% of data is not NA or 0)
+    return((na_pct <= 0.10) & (zero_pct <= 0.10))
+  }))
+```
+
+# Updated Data Tables
+
+## Variable Category Breakdown
+
+```{r, echo=FALSE}
+# Create a filtered data dictionary
+filtered_variable_dictionary <- tibble(
+  category = c(
+    # Watershed identifiers
+    rep("Watershed Identifiers", 4),
+    
+    # StreamCat - Baseflow and Topography
+    rep("StreamCat - Baseflow and Topography", 2),
+    
+    # StreamCat - Land Cover (reduced set after filtering)
+    rep("StreamCat - Land Cover (NLCD 2019)", 5),
+    
+    # StreamCat - PRISM Climate
+    rep("StreamCat - PRISM Climate", 5),
+    
+    # StreamCat - Soil characteristics
+    rep("StreamCat - Soil Characteristics", 6),
+    
+    # Dominant watershed aspect
+    rep("Watershed Aspect", 2),
+    
+    # GridMET climate data
+    rep("GridMET Climate (2001-2020)", 5),
+    
+    # Snow persistence
+    rep("Snow Persistence", 1),
+    
+    # Watershed geometry
+    rep("Watershed Geometry", 10)
+  ),
+  
+  variable = c(
+    # Watershed identifiers
+    "site_no", "comid", "geometry", "transbasin",
+    
+    # StreamCat - Baseflow and Topography
+    "bfiws", "elevws",
+    
+    # StreamCat - Land Cover (filtered subset)
+    "pctdecid2019ws", "pctgrs2019ws", "pctmxfst2019ws", "pctshrb2019ws", "pctwdwet2019ws",
+    
+    # StreamCat - PRISM Climate
+    "precip8110ws", "precip9120ws", "tmax9120ws", "tmean9120ws", "tmin9120ws",
+    
+    # StreamCat - Soil characteristics
+    "clayws", "sandws", "wtdepws", "omws", "permws", "rckdepws",
+    
+    # Dominant watershed aspect
+    "aspect", "mean_northness",
+    
+    # GridMET climate data
+    "pet_mm_2001_2020", "ppt_mm_2001_2020", "tmax_C_2001_2020", 
+    "tmin_C_2001_2020", "tmean_C_2001_2020",
+    
+    # Snow persistence
+    "mean_sp_2001_2020",
+    
+    # Watershed geometry
+    "shape_complexity", "elongation", "compactness", "perimeter_area", 
+    "linearity", "orientation_deg", "rel_circ_circle", "area_km2", 
+    "perimeter_km", "circularity"
+  ),
+  
+  description = c(
+    # Watershed identifiers
+    "USGS site number", 
+    "NHDPlus Common Identifier",
+    "Spatial geometry of watershed",
+    "Indicates if watershed is natural or modified",
+    
+    # StreamCat - Baseflow and Topography
+    "Baseflow index (groundwater contribution to streamflow)",
+    "Mean elevation (m) from National Elevation Dataset",
+    
+    # StreamCat - Land Cover (filtered subset)
+    "Percentage of deciduous forest in 2019",
+    "Percentage of grassland/herbaceous in 2019",
+    "Percentage of mixed forest in 2019",
+    "Percentage of shrubland in 2019",
+    "Percentage of woody wetlands in 2019",
+    
+    # StreamCat - PRISM Climate
+    "Mean annual precipitation (mm) for 1981-2010",
+    "Mean annual precipitation (mm) for 1991-2020",
+    "Mean annual maximum temperature (°C) for 1991-2020",
+    "Mean annual average temperature (°C) for 1991-2020",
+    "Mean annual minimum temperature (°C) for 1991-2020",
+    
+    # StreamCat - Soil characteristics
+    "Percentage of clay content in soil",
+    "Percentage of sand content in soil",
+    "Water table depth (cm)",
+    "Organic matter content (%)",
+    "Soil permeability (cm/hr)",
+    "Depth to bedrock (cm)",
+    
+    # Dominant watershed aspect
+    "Dominant cardinal direction (North, East, South, West)",
+    "Average northness value (-1 to 1, south to north)",
+    
+    # GridMET climate data
+    "Mean potential evapotranspiration (mm) for 2001-2020",
+    "Mean precipitation (mm) for 2001-2020",
+    "Mean maximum temperature (°C) for 2001-2020",
+    "Mean minimum temperature (°C) for 2001-2020",
+    "Mean average temperature (°C) for 2001-2020",
+    
+    # Snow persistence
+    "Mean snow persistence (days/year with snow cover) for 2001-2020",
+    
+    # Watershed geometry
+    "Shape complexity index (higher = more complex)",
+    "Elongation ratio (1 = circle, <1 = elongated)",
+    "Compactness ratio (higher = more compact)",
+    "Perimeter-area ratio",
+    "Linearity index (higher = more linear)",
+    "Watershed orientation in degrees",
+    "Related circumscribing circle",
+    "Watershed area in square kilometers",
+    "Watershed perimeter in kilometers",
+    "Circularity index (1 = perfect circle)"
+  )
+)
+
+# Create a table showing category breakdown
+category_summary <- filtered_variable_dictionary %>%
+  count(category, name = "variable_count") %>%
+  arrange(desc(variable_count))
+
+# Display category summary
+knitr::kable(category_summary, 
+             caption = "Number of Variables by Category After Filtering")
+```
+
+## Data Dictionary
+
+```{r, echo=FALSE}
+knitr::kable(filtered_variable_dictionary, 
+             caption = "Data Dictionary for Filtered Variable Selection (Variables with ≥90% Meaningful Data)")
+```
+
+```{r, echo=FALSE, eval=FALSE}
+# Calculate what percentage of original variables were retained
+original_count <- nrow(variable_dictionary)
+filtered_count <- nrow(filtered_variable_dictionary)
+retention_rate <- round((filtered_count / original_count) * 100, 1)
+
+# Create a comparison of variable categories before and after filtering
+category_comparison <- tibble(
+  category = unique(variable_dictionary$category),
+  original_count = sapply(unique(variable_dictionary$category), 
+                          function(cat) sum(variable_dictionary$category == cat)),
+  filtered_count = sapply(unique(variable_dictionary$category), 
+                          function(cat) sum(filtered_variable_dictionary$category == cat, na.rm = TRUE)),
+  retention_rate = round((filtered_count / original_count) * 100, 1)
+) %>%
+  mutate(
+    retention_rate = ifelse(is.nan(retention_rate), 0, retention_rate),
+    filtered_count = ifelse(is.na(filtered_count), 0, filtered_count)
+  ) %>%
+  arrange(desc(retention_rate))
+
+# Display category comparison
+knitr::kable(category_comparison, 
+             caption = paste0("Category Retention Rates (Overall: ", retention_rate, "% of variables retained)"))
+```
+
+```{r, eval=FALSE, echo=FALSE}
+# Read in the filtered watersheds from site selection process
+watersheds_div <- read_rds(here('data', 'watersheds_div.rds'))
+
+final_gage_sites <- watersheds_div %>% 
+  filter(transbasin == "NATURAL")
+```
+
+# StreamCat Watershed Characteristics
+
+## Data Source
+EPA's StreamCat (Stream-Catchment) database provides standardized watershed-level summaries of natural and anthropogenic landscape features for streams across the conterminous United States. The dataset contains comprehensive predictor variables for reference watersheds with minimal human modification (less than 10% urban development and dam storage density below 100,000 ML/km²).
+
+### Variables
+
+#### Baseflow and Topography
+- **bfi**: Baseflow index from USGS (groundwater contribution to streamflow)
+- **elev**: Mean elevation (m) from National Elevation Dataset (NED)
+
+#### Lithology (USGS Surficial Geology)
+- **pctalkintruvol**: Percentage of alkaline intrusive volcanic rocks
+- **pctcarbresid**: Percentage of carbonate residual material
+- **pctcolluvsed**: Percentage of colluvial sediments
+- **pctcoastcrs**: Percentage of coarse-textured coastal zone sediments
+- **pcteolcrs**: Percentage of coarse-textured eolian deposits
+- **pcteolfine**: Percentage of fine-textured eolian (wind-blown) deposits
+- **pctextruvol**: Percentage of extrusive volcanic rocks
+- **pctglaclakecrs**: Percentage of coarse-textured glacial lake deposits
+- **pctglaclakefine**: Percentage of fine-textured glacial lake deposits
+- **pctglactilclay**: Percentage of glacial till clay
+- **pctglactilcrs**: Percentage of coarse-textured glacial till
+- **pctglactilloam**: Percentage of glacial till loam
+- **pcthydric**: Percentage of hydric soils
+- **pctnoncarbresid**: Percentage of non-carbonate residual material
+- **pctsallake**: Percentage of saline lake deposits
+- **pctsilicic**: Percentage of silicic rocks
+- **pctwater**: Percentage of water (open water features)
+
+#### Land Cover (NLCD 2019)
+- **pctbl2019**: Percentage of barren land
+- **pctconif2019**: Percentage of coniferous forest
+- **pctcrop2019**: Percentage of cultivated crops
+- **pctdecid2019**: Percentage of deciduous forest
+- **pctgrs2019**: Percentage of grassland/herbaceous
+- **pcthay2019**: Percentage of pasture/hay
+- **pcthbwet2019**: Percentage of herbaceous wetlands
+- **pctice2019**: Percentage of permanent ice/snow
+- **pctmxfst2019**: Percentage of mixed forest
+- **pctow2019**: Percentage of open water
+- **pctshrb2019**: Percentage of shrubland
+- **pctwdwet2019**: Percentage of woody wetlands
+
+#### Urban Land Cover
+- **pcturbhi2019**: Percentage of high density urban land cover (apartments, commercial/industrial)
+- **pcturblo2019**: Percentage of low density urban land cover (single-family housing areas)
+- **pcturbmd2019**: Percentage of medium density urban land cover (mix of constructed materials and vegetation)
+- **pcturbop2019**: Percentage of open urban land cover (parks, golf courses, large-lot development)
+
+#### Artificial Modifications
+- **canaldens**: Canal density (km/km²)
+- **damdens**: Dam density (dams/km²)
+- **damnidstor**: Dam normal storage (ML/km²)
+- **damnrmstor**: Dam maximum storage (ML/km²)
+
+#### PRISM Climate
+- **precip8110**: Mean annual precipitation (mm) for 1981-2010
+- **precip9120**: Mean annual precipitation (mm) for 1991-2020
+- **tmax9120**: Mean annual maximum temperature (°C) for 1991-2020
+- **tmean9120**: Mean annual average temperature (°C) for 1991-2020
+- **tmin9120**: Mean annual minimum temperature (°C) for 1991-2020
+
+#### Soil Characteristics
+- **clay**: Percentage of clay content in soil
+- **sand**: Percentage of sand content in soil
+- **wtdep**: Water table depth (cm)
+- **om**: Organic matter content (%)
+- **perm**: Soil permeability (cm/hr)
+- **rckdep**: Depth to bedrock (cm)
+
+```{r, eval=FALSE}
+# Lithology variables (from USGS Surficial Geology dataset)
+lithology_vars <- c(
+  "pctalkintruvol",   # Percentage of alkaline intrusive volcanic rocks
+  "pctwater",         # Percentage of water (open water features)
+  "pctsilicic",       # Percentage of silicic rocks
+  "pctsallake",       # Percentage of saline lake deposits
+  "pctnoncarbresid",  # Percentage of non-carbonate residual material
+  "pcthydric",        # Percentage of hydric soils
+  "pctglactilloam",   # Percentage of glacial till loam
+  "pctglactilcrs",    # Percentage of coarse-textured glacial till
+  "pctglactilclay",   # Percentage of glacial till clay
+  "pctglaclakefine",  # Percentage of fine-textured glacial lake deposits
+  "pctglaclakecrs",   # Percentage of coarse-textured glacial lake deposits
+  "pctextruvol",      # Percentage of extrusive volcanic rocks
+  "pcteolfine",       # Percentage of fine-textured eolian (wind-blown) deposits
+  "pcteolcrs",        # Percentage of coarse-textured eolian deposits
+  "pctcolluvsed",     # Percentage of colluvial sediments
+  "pctcoastcrs",      # Percentage of coarse-textured coastal zone sediments
+  "pctcarbresid"      # Percentage of carbonate residual material
+)
+
+# Urban cover in 2019 (from NLCD 2019)
+urban_cover <- c(
+  "pcturbop2019",  # Percentage of open urban land cover in 2019 (parks, golf courses, large-lot development)
+  "pcturbmd2019",  # Percentage of medium density urban land cover in 2019 (mix of constructed materials and vegetation)
+  "pcturblo2019",  # Percentage of low density urban land cover in 2019 (single-family housing areas)
+  "pcturbhi2019"   # Percentage of high density urban land cover in 2019 (apartments, commercial/industrial)
+)
+
+# Artificial modifications (from NHD and National Inventory of Dams)
+artificial_modifications <- c(
+  "canaldens",   # Canal density (km/km²)
+  "damdens",     # Dam density (dams/km²)
+  "damnidstor",  # Dam normal storage (ML/km²)
+  "damnrmstor"   # Dam maximum storage (ML/km²)
+)
+
+# PRISM Climate Variables (from PRISM Climate Group, Oregon State University)
+prism_climate <- c(
+  "precip8110",  # Mean annual precipitation (mm) for the period 1981-2010
+  "precip9120",  # Mean annual precipitation (mm) for the period 1991-2020
+  "tmax9120",    # Mean annual maximum temperature (°C) for 1991-2020
+  "tmean9120",   # Mean annual average temperature (°C) for 1991-2020
+  "tmin9120"     # Mean annual minimum temperature (°C) for 1991-2020
+)
+
+# Land Cover (from NLCD 2019)
+nlcd_land_cover_2019 <- c(
+  "pctow2019",       # Percentage of open water in 2019
+  "pctice2019",      # Percentage of permanent ice/snow in 2019
+  "pcturbop2019",    # Percentage of open urban land in 2019
+  "pcturblo2019",    # Percentage of low-intensity urban land in 2019
+  "pcturbmd2019",    # Percentage of medium-intensity urban land in 2019
+  "pcturbhi2019",    # Percentage of high-intensity urban land in 2019
+  "pctbl2019",       # Percentage of barren land in 2019
+  "pctdecid2019",    # Percentage of deciduous forest in 2019
+  "pctconif2019",    # Percentage of coniferous forest in 2019
+  "pctmxfst2019",    # Percentage of mixed forest in 2019
+  "pctshrb2019",     # Percentage of shrubland in 2019
+  "pctgrs2019",      # Percentage of grassland/herbaceous in 2019
+  "pcthay2019",      # Percentage of pasture/hay in 2019
+  "pctcrop2019",     # Percentage of cultivated crops in 2019
+  "pctwdwet2019",    # Percentage of woody wetlands in 2019
+  "pcthbwet2019"     # Percentage of herbaceous wetlands in 2019
+)
+
+# Soil characteristics (from STATSGO soil database)
+soil_characteristics <- c(
+  "clay",            # Percentage of clay content in soil
+  "sand",            # Percentage of sand content in soil
+  "wtdep",           # Water table depth (cm)
+  "om",              # Organic matter content (%)
+  "perm",            # Soil permeability (cm/hr)
+  "rckdep"           # Depth to bedrock (cm)
+)
+
+# Retrieve watershed attributes from the EPA's StreamCat database
+streamcat_vars <- StreamCatTools::sc_get_data(
+  # Combine all our desired metrics into a single comma-separated string
+  metric = paste(c(
+    "bfi",       # Baseflow index from USGS (groundwater contribution to streamflow)
+    "elev",      # Mean elevation (m) from NED (National Elevation Dataset)
+    lithology_vars, 
+    urban_cover, 
+    artificial_modifications,
+    prism_climate,
+    nlcd_land_cover_2019,
+    soil_characteristics
+    ), collapse = ","),
+  aoi = 'watershed',  # Query for entire watershed upstream of each point
+  comid = final_gage_sites$comid) %>%  # Use our previously identified COMIDs
+  # remove excess variables:
+  select(-contains("AREASQKM"))
+
+# Combine the watershed polygons with the streamcat data
+streamcat_watersheds <- final_gage_sites %>%
+  left_join(., streamcat_vars, by = "comid")
+
+write_rds(streamcat_watersheds, here("data", "streamcat_watersheds_variables.rds"))
+```
+
+## Baseflow and Elevation
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_hydrology_topography.png"))
+```
+
+## Land Cover Distribution
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_landcover.png"))
+```
+
+## Climate Data (PRISM)
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_climate_combined.png"))
+```
+
+## Soil Characteristics
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_soil_properties.png"))
+```
+
+
+# Watershed Aspect Analysis
+
+## Data Source
+Elevation data retrieved using the elevatr package at zoom level 12, processed with the terra package to calculate terrain aspect. Aspect represents the direction that a slope faces, which influences solar radiation, moisture levels, and ecological conditions within watersheds.
+
+### Variables
+- **aspect**: Dominant cardinal direction of the watershed (North, East, South, West)
+- **mean_northness**: Average northness value across the watershed, ranging from -1 (completely south-facing) to 1 (completely north-facing)
+
+```{r, eval=FALSE}
+calculate_watershed_orientation <- function(site_no_arg){
+  
+  # Load required packages in workers (for parallel processing)
+  require(sf)
+  require(terra)
+  require(dplyr)
+  
+  # Create numerical representation for each cardinal aspect
+  aspect_lookup <- tibble(val = c(1, 2, 3, 4),
+                          aspect = c("North", "East", "South", "West"))
+  
+  # Filter the master dataset to get only the watershed being analyzed
+  site <- final_gage_sites %>%
+    filter(site_no == site_no_arg)
+  
+  # Retrieve elevation data for the site at zoom level 12 and mask it to the watershed boundary
+  # Set random sleep time before get elevation call for parallel execution
+  # Set up RNG properly within the function
+  set.seed(sample.int(.Machine$integer.max, 1))
+  Sys.sleep(runif(1, 1, 3))
+  tryCatch({
+    
+    suppressMessages(
+      elev <- elevatr::get_elev_raster(summarize(site), z = 12, clip = "locations") %>% 
+        terra::rast() %>% 
+        terra::mask(., site, touches = FALSE)
+    )
+    
+    # Calculate aspect (the direction slopes are facing) from the elevation data
+    aspect <- terra::terrain(elev, v = 'aspect')
+    
+    # Helper function to convert aspect values in degrees to cardinal directions (1-4)
+    convert_to_direction <- function(aspect) {
+      direction <- rep(NA, length(aspect))
+      direction[aspect >= 0 & aspect <= 45 | aspect > 315 & aspect <= 360] <- 1  # North
+      direction[aspect > 45 & aspect <= 135] <- 2  # East
+      direction[aspect > 135 & aspect <= 225] <- 3  # South
+      direction[aspect > 225 & aspect <= 315] <- 4  # West
+      return(direction)
+    }
+    
+    # Apply the conversion function to the aspect raster to get cardinal directions
+    aspect_cardinal_raster <- terra::app(aspect, fun = convert_to_direction) 
+    
+    # Calculate northness: cos(aspect) ranges from 1 (north-facing) to -1 (south-facing)
+    northness <- terra::app(aspect, fun = function(x) cos(x * pi / 180))
+    
+    # Find the most common (dominant) aspect direction in the watershed
+    dominant_aspect <- as.data.table(aspect_cardinal_raster) %>%
+      rename(val = lyr.1) %>%
+      group_by(val) %>%
+      summarize(count = n()) %>%
+      filter(count == max(count)) %>%
+      left_join(aspect_lookup, by = "val") %>%
+      mutate(site_no = site$site_no)
+    
+    # Calculate the average northness value for the entire watershed
+    mean_northness <- as.data.table(northness) %>%
+      rename(northness = lyr.1) %>%
+      summarize(mean_northness = mean(northness, na.rm = TRUE)) %>%
+      mutate(site_no = site$site_no)
+    
+    # Combine dominant aspect and mean northness
+    result <- dominant_aspect %>%
+      left_join(mean_northness, by = "site_no") %>% 
+      select(site_no, aspect, mean_northness)
+    
+    return(result)
+  }, error = function(e){
+    message("Error processing site", site_no_arg, ": ", e$message)
+    return(NULL)
+  })
+}
+
+# Set up parallel processing ----
+
+# Set up parallel processing with fewer workers to reduce server load
+num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
+message("Setting up parallel processing with ", num_workers, " workers")
+plan(multisession, workers = num_workers)
+furrr_options(
+  packages = c("sf", "terra", "dplyr", "elevatr"),
+  globals = TRUE,
+  seed = TRUE
+)
+
+# Process in chunks to reduce memory pressure and server load
+chunk_size <- 10
+aspect_total_sites <- nrow(streamcat_watersheds)
+aspect_chunks <- split(1:aspect_total_sites, ceiling(seq_along(1:aspect_total_sites) / chunk_size))
+
+aspect_results <- list()
+
+for (chunk_idx in seq_along(aspect_chunks)) {
+  
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(aspect_chunks), " ===")
+  
+  # Get the indices for this chunk
+  indices <- aspect_chunks[[chunk_idx]]
+  chunk_data <-streamcat_watersheds[indices, ]
+  
+  # Process this chunk in parallel
+  chunk_results <- chunk_data$site_no %>%
+    future_map(safely(calculate_watershed_orientation), .progress = TRUE)
+  
+  # Progress chunk results
+  chunk_results <- chunk_results %>% 
+    transpose() %>% 
+    pluck(1) %>% 
+    compact() %>% 
+    bind_rows()
+  
+  # Add successful results to our collection
+  aspect_results[[chunk_idx]] <- chunk_results
+  
+  # Take a short break between chunks to avoid memory issues
+  if (chunk_idx < length(aspect_chunks)) {
+      message("Taking a short break before next chunk...")
+      Sys.sleep(3)
+    }
+    
+}
+
+# Process final results ----
+aspect_results <- aspect_results %>% 
+  bind_rows()
+
+aspect_results <- streamcat_watersheds %>% 
+  left_join(aspect_results, by = "site_no")
+
+# Save sites with streamcat and aspect data
+write_rds(aspect_results, here("data", "streamcat_aspect_variables.rds"))
+```
+
+## Dominant Aspect Direction
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_dominant_aspect.png"))
+```
+
+## Northness Distribution
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_northness.png"))
+```
+
+# GridMET Climate Analysis
+
+## Data Source
+University of Idaho's Gridded Surface Meteorological Dataset (GridMET) provides high-resolution (4km) daily meteorological data across the contiguous United States. This analysis uses the climateR package to retrieve data for the period 2001-2020, capturing recent climate conditions at a finer spatial resolution than PRISM data.
+
+### Variables
+- **pet_mm_2001_2020**: Mean potential evapotranspiration (mm) for 2001-2020
+- **ppt_mm_2001_2020**: Mean precipitation (mm) for 2001-2020
+- **tmax_C_2001_2020**: Mean maximum temperature (°C) for 2001-2020
+- **tmin_C_2001_2020**: Mean minimum temperature (°C) for 2001-2020
+- **tmean_C_2001_2020**: Mean average temperature (°C) for 2001-2020 (derived from max and min)
+
+```{r, eval=FALSE}
+# Function to download and process GridMET climate data for spatial features
+# Downloads temperature (max/min), precipitation, and potential evapotranspiration
+# Processes data into a standardized format with calculated values
+get_historic_climate <- function(aoi_arg) {
+  
+  message(paste0('\nDownloading GridMET for ', aoi_arg$site_no, "."))
+  
+  if(any(unique(sf::st_geometry_type(aoi_arg)) %in% c("POLYGON", "MULTIPOLYGON"))){
+    
+    # Set random sleep time before server call
+    Sys.sleep(runif(1, 1, 3))
+    historic_climate <- climateR::getGridMET(AOI = aoi_arg,
+                                             varname = c("pet", "pr", "tmmn", "tmmx"),
+                                             startDate = "2001-01-01",
+                                             endDate = "2020-12-31")
+    
+    # Check if returned data is in SpatRaster format
+    if(inherits(historic_climate[[1]], "SpatRaster")){
+      
+      historic_climate_crs <- st_crs(historic_climate[[1]])
+      
+      # Handle CRS mismatches between climate data and input features
+      if(st_crs(historic_climate[[1]]) != st_crs(aoi_arg)){
+        # Transform feature to climate data CRS and crop/mask climate data to feature boundary
+        historic_climate <- historic_climate %>%
+          purrr::map(
+            # getGridMET defaults AOI to bbox - so crop & mask results to actual feature boundary
+            ~terra::crop(., st_transform(aoi_arg, crs = historic_climate_crs), mask = TRUE),
+            crs = historic_climate_crs)
+      } else {
+        # If CRS already matches, just crop/mask without transformation
+        historic_climate <- historic_climate %>%
+          purrr::map(
+            ~terra::crop(., aoi_arg, mask = TRUE),
+            crs = historic_climate_crs)
+      }
+      
+      # Process climate data into a tidy dataframe
+      historic_climate_df <- historic_climate %>%
+        # Convert raster to df with coordinates
+        purrr::map_dfr(~ as.data.frame(., xy = TRUE)) %>%
+        data.table() %>%
+        # Reshape data from wide to long
+        pivot_longer(-(x:y),
+                     names_to = "var_temp",
+                     values_to = "val") %>%
+        separate_wider_delim(var_temp, "_", names = c("var", "date")) %>% # Split variable name from date
+        drop_na(val) %>%
+        group_by(x, y, date) %>%
+        # Reshape back to wide format with clean variable names
+        pivot_wider(names_from = "var", values_from = "val") %>%
+        # Calculate derived variables and convert units
+        dplyr::mutate(date = as.Date(date),
+                      pet_mm = pet,                   # Potential evapotranspiration (mm)
+                      ppt_mm = pr,                    # Precipitation (mm)
+                      tmax_C = tmmx - 273.15,         # Convert max temp from Kelvin to Celsius
+                      tmin_C = tmmn - 273.15,         # Convert min temp from Kelvin to Celsius
+                      tmean_C = (tmax_C + tmin_C)/2,   # Calculate mean temperature
+                      site_no = aoi_arg$site_no) %>%  
+        dplyr::select(-c("tmmx", "tmmn", "pr", "pet"))
+      
+      # save the data so far in a file
+      write_rds(historic_climate_df, here("data", "parallel_gridmet_data", paste0(aoi_arg$site_no,".rds")))
+      
+      # generate the row that will get saved to join to the data
+      historic_climate_row <- historic_climate_df %>% 
+        group_by(site_no) %>% 
+        summarize(across(c(pet_mm, ppt_mm, tmax_C, tmin_C, tmean_C), 
+                         ~mean(as.numeric(.),na.rm = T)), 
+                  .groups = "drop") %>% 
+        rename(
+          pet_mm_2001_2020 = pet_mm,
+          ppt_mm_2001_2020 = ppt_mm, 
+          tmax_C_2001_2020 = tmax_C, 
+          tmin_C_2001_2020 = tmin_C,
+          tmean_C_2001_2020 = tmean_C
+        )
+    } else {
+      # Handle case where climate data is returned as a single grid cell (point data)
+      
+      historic_climate_df <- historic_climate %>%
+        data.table() %>%
+        # Clean variable names
+        rename_with(~ str_split(.x, "_", n = 2) %>% map_chr(1)) %>%
+        # Since point features only have one grid cell, manually add coordinates
+        dplyr::mutate(x = sf::st_coordinates(aoi_arg)[[1]],
+                      y = sf::st_coordinates(aoi_arg)[[2]]) %>%
+        # Calculate derived variables as with polygon features
+        dplyr::mutate(date = as.Date(date),
+                      pet_mm = pet,
+                      ppt_mm = pr,
+                      tmax_C = tmmx - 273.15,
+                      tmin_C = tmmn - 273.15,
+                      tmean_C = (tmax_C + tmin_C)/2,
+                      site_no = aoi_arg$site_no) %>%
+        dplyr::select(-c("tmmx", "tmmn", "pr", "pet")) 
+      
+      # save the data so far in a file
+      write_rds(historic_climate_df, here("data", "parallel_gridmet_data", paste0(aoi_arg$site_no,".rds")))
+      
+      # generate the row that will get saved to join to the data
+      historic_climate_row <- historic_climate_df %>% 
+        group_by(site_no) %>% 
+        summarize(across(c(pet_mm, ppt_mm, tmax_C, tmin_C, tmean_C), 
+                         ~mean(as.numeric(.),na.rm = T)), 
+                  .groups = "drop") %>% 
+        rename(
+          pet_mm_2001_2020 = pet_mm,
+          ppt_mm_2001_2020 = ppt_mm, 
+          tmax_C_2001_2020 = tmax_C, 
+          tmin_C_2001_2020 = tmin_C,
+          tmean_C_2001_2020 = tmean_C
+        )
+    }
+    
+    return(historic_climate_row)
+    
+  } else {
+    stop("Your watershed_aoi_row feature is neither a polygon nor point feature, or it needs to be made valid.")
+  }
+}
+
+# Set up parallel processing ----
+
+# Set up parallel processing with fewer workers to reduce server load
+num_workers <- min(availableCores() - 1, 6) # Use at most 6 workers
+message("Setting up parallel processing with ", num_workers, " workers")
+plan(multisession, workers = num_workers)
+furrr_options(
+  packages = c("sf", "terra", "dplyr", "data.table", "tidyr", "stringr", "climateR"),
+  globals = TRUE,
+  seed = TRUE
+)
+
+# Process in chunks to reduce memory pressure
+chunk_size <- 10
+gridmet_total_sites <- nrow(aspect_results)
+gridmet_chunks <- split(1:gridmet_total_sites, ceiling(seq_along(1:gridmet_total_sites)/chunk_size))
+
+gridmet_results <- list()
+
+for (chunk_idx in seq_along(gridmet_chunks)) {
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(gridmet_chunks), " ===")
+  
+  # Get the indices for this chunk
+  indices <- gridmet_chunks[[chunk_idx]]
+  chunk_data <- aspect_results[indices, ]
+  
+  # Process this chunk in parallel
+  chunk_results <- future_map(split(chunk_data, 1:nrow(chunk_data)),
+                              ~safely(get_historic_climate)(aoi_arg = .x),
+                              .options = furrr_options(seed = TRUE),
+                              .progress = TRUE) 
+  
+  chunk_results <- chunk_results %>% 
+    transpose() %>% 
+    pluck(1) %>% 
+    compact() %>% 
+    bind_rows()
+  
+  # Add successful results to our collection
+  gridmet_results[[chunk_idx]] <- chunk_results
+  
+  # Take a short break between chunks to avoid memory issues
+  if (chunk_idx < length(gridmet_chunks)) {
+    message("Taking a short break before next chunk...")
+    Sys.sleep(3)
+  }
+  
+}
+
+# Process final results ----
+gridmet_results <- gridmet_results %>% 
+  bind_rows()
+
+gridmet_results <- aspect_results %>% 
+  left_join(gridmet_results, by = "site_no")
+
+# Save sites with streamcat, aspect, and gridmet data
+write_rds(gridmet_results, here("data", "streamcat_aspect_gridmet_variables.rds"))
+```
+
+## GridMET Climate (and comparison with PRISM data)
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_climate_combined.png"))
+```
+
+# Snow Persistence Analysis
+
+## Data Source
+Snow persistence data derived from the Hammond et al. dataset, which utilizes MODIS satellite imagery to quantify the duration of snow cover. Files are processed to extract area-weighted mean values for each watershed boundary, providing a consistent metric for snow presence across the study area for the period 2001-2020.
+
+### Variables
+- **mean_sp_2001_2020**: Mean annual snow persistence (days per year with snow cover) averaged over the 2001-2020 period
+
+```{r, eval=FALSE}
+# load all the .tif files into a list
+tif_files <- list.files(here("data", "snow_persistence_hammond"), pattern = "\\.tif$", full.names = TRUE)
+
+# stack the snow persistence .tif files into a single raster stack
+raster_stack <- rast(tif_files)
+
+# convert the shapefile to a 'terra' object (if necessary)
+polygon <- st_transform(gridmet_results, crs(raster_stack))  # Align CRS
+
+# convert the polygons to 'terra' vector format
+polygon_terra <- vect(polygon)
+
+# mask the raster stack to the watershed polygons
+masked_stack <- mask(raster_stack, polygon_terra)
+
+# extract mean SP across each watershed. weights = TRUE means get the area-weighted average
+mean_sp <- extract(masked_stack, polygon_terra, fun = mean, weights = TRUE)
+
+# Process final results ----
+watershed_sp <- as_tibble(mean_sp) %>%
+  bind_cols(st_drop_geometry(gridmet_results)) %>%
+  select(-ID) %>% 
+  pivot_longer(cols = c(contains("MOD"))) %>% 
+  group_by(site_no, comid, transbasin) %>% 
+  summarize(mean_sp_2001_2020 = mean(value), .groups = 'drop') %>%
+  select(site_no, mean_sp_2001_2020)
+
+snow_persistence_results <- gridmet_results %>% 
+  left_join(watershed_sp, by = "site_no")
+```
+
+## Snow Persistence (along with BFI and Elevation)
+
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_hydrology_combined.png"))
+```
+
+
+# Watershed Geometry Analysis
+
+## Data Source
+Geometric metrics calculated using WhiteBox Tools geospatial analysis package, which provides specialized functions for quantifying landform shapes and characteristics based on watershed boundaries.
+
+### Variables
+- **shape_complexity**: Shape complexity index (higher values indicate more complex watershed shapes)
+- **elongation**: Elongation ratio (1 = circle, <1 = elongated)
+- **compactness**: Compactness ratio (higher values indicate more compact watersheds)
+- **perimeter_area**: Perimeter-area ratio
+- **linearity**: Linearity index (higher values indicate more linear watersheds)
+- **orientation_deg**: Watershed orientation in degrees
+- **rel_circ_circle**: Related circumscribing circle
+- **area_km2**: Watershed area in square kilometers
+- **perimeter_km**: Watershed perimeter in kilometers
+- **circularity**: Circularity index (1 = perfect circle)
+
+```{r, eval=FALSE}
+calculate_watershed_geometry <- function(aoi_arg) {
+  
+  # Set random sleep time to prevent parallelization mishaps
+  Sys.sleep(runif(1, 1, 3))
+  
+  # Set up temporary directory
+  output_dir <- here("data", "watershed_geometry")
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+   # Input validation
+  if (!inherits(aoi_arg, "sf")) {
+    message(paste("Skipping site", site_id, "- Input must be an sf object"))
+    return(NULL)
+  }
+  
+  # Save watersheds to shapefile for whitebox processing
+  site_no <- aoi_arg$site_no
+  watersheds_path <- file.path(output_dir, paste0(site_no, "_watershed.shp"))
+  
+  # Subset to just keep geometry and ID info
+  watershed <- aoi_arg %>% 
+    select(site_no, comid)
+  
+  st_write(watershed, watersheds_path, delete_dsn = TRUE, quiet = TRUE)
+  
+  message("\nCalculating shape metrics for ", site_no,"...")
+  # Calculate metrics - wrap in tryCatch to ensure one failure doesn't stop all processing
+  tryCatch({
+    # Calculate shape complexity index
+    wbt_shape_complexity_index(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate elongation ratio
+    wbt_elongation_ratio(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate compactness ratio
+    wbt_compactness_ratio(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate perimeter-area ratio
+    wbt_perimeter_area_ratio(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate linearity index
+    wbt_linearity_index(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate patch orientation
+    wbt_patch_orientation(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Calculate related circumscribing circle
+    wbt_related_circumscribing_circle(
+      input = watersheds_path,
+      wd = output_dir
+    )
+    
+    # Read back the shapefile with all the metrics
+    watersheds_with_metrics <- st_read(watersheds_path, quiet = TRUE)
+    
+    # Add basic geometric calculations
+    watersheds_with_metrics <- watersheds_with_metrics %>%
+      mutate(
+        area_km2 = as.numeric(st_area(geometry)) / 1e6,
+        perimeter_km = as.numeric(st_length(st_cast(geometry, "MULTILINESTRING"))) / 1000,
+        circularity = (4 * pi * area_km2) / (perimeter_km^2)
+      )
+    
+    # Rename fields to be more descriptive
+    watersheds_with_metrics <- watersheds_with_metrics %>%
+      rename(
+        shape_complexity = COMPLEXITY,
+        elongation = ELONGATION,
+        compactness = COMPACT,
+        perimeter_area = P_A_RATIO,
+        linearity = LINEARITY,
+        orientation_deg = ORIENT,
+        rel_circ_circle = RC_CIRCLE
+      )
+    
+    return(watersheds_with_metrics)
+  }, error = function(e) {
+    message(paste("Error processing watershed", site_no, ":", e$message))
+    return(NULL)
+  })
+}
+
+# Set up parallel processing ----
+
+# Set up parallel processing with fewer workers to reduce server load
+num_workers <- min(availableCores() - 1, 6) # Use at most 6 workers
+message("Setting up parallel processing with ", num_workers, " workers")
+plan(multisession, workers = num_workers)
+furrr_options(
+  packages = c("sf", "whitebox", "terra", "dplyr", "here"),
+  globals = TRUE,
+  seed = TRUE
+)
+
+# Process in chunks to reduce memory pressure
+chunk_size <- 10
+whitebox_total_sites <- nrow(snow_persistence_results)
+whitebox_chunks <- split(1:whitebox_total_sites, ceiling(seq_along(1:whitebox_total_sites)/chunk_size))
+
+whitebox_results <- list()
+
+for (chunk_idx in seq_along(whitebox_chunks)) {
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(whitebox_chunks), " ===")
+  
+  # Get the indices for this chunk
+  indices <- whitebox_chunks[[chunk_idx]]
+  chunk_data <- snow_persistence_results[indices, ] %>% 
+    select(site_no, comid)
+  
+  # Process this chunk in parallel
+  chunk_results <- future_map(
+    1:nrow(chunk_data),
+    function(i) {
+      # Extract a single row while maintaining sf properties
+      row_data <- chunk_data[i,]
+      safely(calculate_watershed_geometry)(aoi_arg = row_data)
+    },
+    .options = furrr_options(seed = TRUE),
+    .progress = TRUE
+  )
+  
+  chunk_results <- chunk_results %>% 
+    transpose() %>% 
+    pluck(1) %>% 
+    compact() %>% 
+    bind_rows()
+  
+  # Add successful results to our collection
+  whitebox_results[[chunk_idx]] <- chunk_results
+  
+  # Take a short break between chunks to avoid memory issues
+  if (chunk_idx < length(whitebox_chunks)) {
+    message("Taking a short break before next chunk...")
+    Sys.sleep(3)
+  }
+  
+}
+
+# Process final results ----
+whitebox_results <- whitebox_results %>% 
+  bind_rows() %>% 
+  st_drop_geometry()
+
+whitebox_results <- snow_persistence_results %>% 
+  left_join(whitebox_results, by = c("site_no", "comid"))
+
+# Save sites with streamcat, aspect, and gridmet data
+write_rds(whitebox_results, here("data", "streamcat_aspect_gridmet_sp_whitebox_variables.rds"))
+```
+
+## Shape Complexity Metrics
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_watershed_shape_part1.png"))
+```
+
+## Size and Orientation Metrics
+```{r, echo=FALSE}
+knitr::include_graphics(here("data", "figures", "filtered_watershed_shape_part2.png"))
+```
+
+```{r, eval = FALSE, echo = FALSE, warning=FALSE}
+# Convert to non-spatial dataframe for plotting
+watershed_data_filtered <- st_drop_geometry(clean_final_variable_selection)
+
+# Create a lookup table for more readable variable names (only for variables in the filtered dataset)
+variable_lookup <- tribble(
+  ~variable_code, ~variable_name,
+  # Watershed identifiers
+  "site_no", "Site Number",
+  "comid", "NHDPlus ID",
+  "transbasin", "Watershed Type",
+  
+  # Baseflow and Topography
+  "bfiws", "Baseflow Index",
+  "elevws", "Elevation (m)",
+  
+  # Land Cover (NLCD 2019) - only the remaining ones
+  "pctdecid2019ws", "Deciduous Forest (2019) (%)",
+  "pctgrs2019ws", "Grassland (2019) (%)",
+  "pctmxfst2019ws", "Mixed Forest (2019) (%)",
+  "pctshrb2019ws", "Shrubland (2019) (%)",
+  "pctwdwet2019ws", "Woody Wetlands (2019) (%)",
+  
+  # PRISM Climate
+  "precip8110ws", "Precipitation 1981-2010 (mm)",
+  "precip9120ws", "Precipitation 1991-2020 (mm)",
+  "tmax9120ws", "Max Temperature 1991-2020 (°C)",
+  "tmean9120ws", "Mean Temperature 1991-2020 (°C)",
+  "tmin9120ws", "Min Temperature 1991-2020 (°C)",
+  
+  # Soil characteristics
+  "clayws", "Clay Content (%)",
+  "sandws", "Sand Content (%)",
+  "wtdepws", "Water Table Depth (cm)",
+  "omws", "Organic Matter (%)",
+  "permws", "Soil Permeability (cm/hr)",
+  "rckdepws", "Depth to Bedrock (cm)",
+  
+  # Watershed Aspect
+  "aspect", "Dominant Aspect Direction",
+  "mean_northness", "Northness (-1=South to 1=North)",
+  
+  # GridMET climate data
+  "pet_mm_2001_2020", "Potential Evapotranspiration (mm)",
+  "ppt_mm_2001_2020", "Precipitation (mm)",
+  "tmax_C_2001_2020", "Maximum Temperature (°C)",
+  "tmin_C_2001_2020", "Minimum Temperature (°C)",
+  "tmean_C_2001_2020", "Mean Temperature (°C)",
+  
+  # Snow persistence
+  "mean_sp_2001_2020", "Snow Persistence (days/year)",
+  
+  # Watershed geometric properties
+  "shape_complexity", "Shape Complexity Index",
+  "elongation", "Elongation Ratio",
+  "compactness", "Compactness Ratio",
+  "perimeter_area", "Perimeter-Area Ratio",
+  "linearity", "Linearity Index",
+  "orientation_deg", "Orientation (degrees)",
+  "rel_circ_circle", "Related Circumscribing Circle",
+  "area_km2", "Watershed Area (km²)",
+  "perimeter_km", "Watershed Perimeter (km)",
+  "circularity", "Circularity Index"
+)
+
+# Function to create histograms for a set of variables with improved labels
+create_histograms <- function(data, vars, title, subtitle = NULL, ncol = 2, fill_color = "skyblue4") {
+  # Convert data to long format for the specified variables
+  data_long <- data %>%
+    select(all_of(vars)) %>%
+    pivot_longer(cols = everything(), 
+                 names_to = "variable_code", 
+                 values_to = "value") %>%
+    # Handle potential NA values
+    filter(!is.na(value)) %>%
+    # Add readable variable names
+    left_join(variable_lookup, by = "variable_code")
+  
+  # Create histograms
+  p <- ggplot(data_long, aes(x = value)) +
+    geom_histogram(aes(y = after_stat(density)), 
+                  fill = fill_color, 
+                  color = "white", 
+                  alpha = 0.7, 
+                  bins = 30) +
+    geom_density(alpha = 0.3, fill = "gray") +
+    facet_wrap(~ variable_name, scales = "free", ncol = ncol) +
+    theme_minimal() +
+    labs(title = title,
+         subtitle = subtitle,
+         x = NULL,
+         y = "Density") +
+    theme(strip.text = element_text(face = "bold", size = 10),
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          plot.subtitle = element_text(hjust = 0.5, size = 11),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(fill = NA, color = "gray80"))
+  
+  return(p)
+}
+
+# 1. StreamCat - Baseflow and Topography
+baseflow_topo_vars <- c("bfiws", "elevws")
+hydrology_topo_plot <- create_histograms(watershed_data_filtered, baseflow_topo_vars, 
+                        "Watershed Hydrology and Topography", 
+                        "Baseflow index quantifies groundwater contribution to streamflow", 
+                        ncol = 2, fill_color = "skyblue3")
+
+# 2. StreamCat - Land Cover (remaining variables only)
+landcover_vars <- c("pctdecid2019ws", "pctgrs2019ws", "pctmxfst2019ws", "pctshrb2019ws", "pctwdwet2019ws")
+landcover_plot <- create_histograms(watershed_data_filtered, landcover_vars, 
+                        "Watershed Land Cover", 
+                        "Distribution of significant land cover types as percentage of watershed area",
+                        ncol = 3, fill_color = "forestgreen")
+
+# 3. StreamCat - PRISM Climate
+prism_vars <- c("precip8110ws", "precip9120ws", "tmax9120ws", "tmean9120ws", "tmin9120ws")
+historical_climate_plot <- create_histograms(watershed_data_filtered, prism_vars, 
+                        "Historical Climate Conditions (PRISM)", 
+                        "Climate normals for precipitation and temperature across two time periods",
+                        ncol = 3, fill_color = "purple4")
+
+# 4. StreamCat - Soil characteristics
+soil_vars <- c("clayws", "sandws", "wtdepws", "omws", "permws", "rckdepws")
+soil_properties_plot <- create_histograms(watershed_data_filtered, soil_vars, 
+                        "Watershed Soil Properties", 
+                        "Physical and chemical characteristics of watershed soils",
+                        ncol = 3, fill_color = "chocolate4")
+
+# 5. Only mean_northness is numeric in the Watershed Aspect category
+aspect_vars <- c("mean_northness")
+northness_plot <- create_histograms(watershed_data_filtered, aspect_vars, 
+                        "Watershed Aspect - Northness", 
+                        "Values near 1 indicate north-facing slopes, values near -1 indicate south-facing slopes",
+                        ncol = 1, fill_color = "gray30")
+
+# 6. GridMET climate data
+gridmet_vars <- c("pet_mm_2001_2020", "ppt_mm_2001_2020", "tmax_C_2001_2020", 
+                  "tmin_C_2001_2020", "tmean_C_2001_2020")
+recent_climate_plot <- create_histograms(watershed_data_filtered, gridmet_vars, 
+                        "Recent Climate Conditions (GridMET, 2001-2020)", 
+                        "Higher resolution climate data for the recent two decades",
+                        ncol = 3, fill_color = "royalblue3")
+
+# 7. Snow persistence
+snow_vars <- c("mean_sp_2001_2020")
+snow_duration_plot <- create_histograms(watershed_data_filtered, snow_vars, 
+                        "Snow Cover Duration", 
+                        "Average number of days per year with snow cover (2001-2020)",
+                        ncol = 1, fill_color = "steelblue")
+
+# 8. Watershed geometric properties
+geo_vars1 <- c("shape_complexity", "elongation", "compactness", "perimeter_area", "linearity")
+geo_vars2 <- c("orientation_deg", "rel_circ_circle", "area_km2", "perimeter_km", "circularity")
+
+watershed_shape_plot_1 <- create_histograms(watershed_data_filtered, geo_vars1, 
+                         "Watershed Shape Characteristics - Part 1", 
+                         "Metrics describing watershed form and complexity",
+                         ncol = 3, fill_color = "slategray")
+watershed_shape_plot_2 <- create_histograms(watershed_data_filtered, geo_vars2, 
+                         "Watershed Shape Characteristics - Part 2", 
+                         "Metrics describing watershed size and orientation",
+                         ncol = 3, fill_color = "slategray4")
+
+# Create a function to create a categorical bar plot for the aspect variable
+create_aspect_barplot <- function(data) {
+  aspect_counts <- data %>%
+    count(aspect) %>%
+    mutate(aspect = factor(aspect, levels = c("North", "East", "South", "West")))
+  
+  p <- ggplot(aspect_counts, aes(x = aspect, y = n, fill = aspect)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+    theme_minimal() +
+    labs(title = "Dominant Watershed Aspect Direction",
+         subtitle = "Count of watersheds by their predominant slope orientation",
+         x = "Cardinal Direction",
+         y = "Number of Watersheds",
+         fill = "Aspect") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          plot.subtitle = element_text(hjust = 0.5, size = 11),
+          axis.text = element_text(size = 10),
+          legend.position = "none")
+  
+  return(p)
+}
+
+# Create the aspect bar plot
+aspect_direction_plot <- create_aspect_barplot(watershed_data_filtered)
+
+# Create combined plots for a more compact representation
+combined_climate_plot <- (historical_climate_plot / recent_climate_plot) + 
+  plot_annotation(title = "Historical vs Recent Climate Conditions",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16)))
+
+combined_hydrology_plot <- (hydrology_topo_plot | snow_duration_plot) + 
+  plot_annotation(title = "Watershed Hydrology Characteristics",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16)))
+
+# Save the plots (uncomment to save)
+# ggsave(here("data", "figures", "filtered_hydrology_topography.png"), hydrology_topo_plot, width = 10, height = 6)
+# ggsave(here("data", "figures", "filtered_landcover.png"), landcover_plot, width = 12, height = 8)
+# ggsave(here("data", "figures", "filtered_climate_combined.png"), combined_climate_plot, width = 12, height = 14)
+# ggsave(here("data", "figures", "filtered_soil_properties.png"), soil_properties_plot, width = 12, height = 8)
+# ggsave(here("data", "figures", "filtered_northness.png"), northness_plot, width = 8, height = 5)
+# ggsave(here("data", "figures", "filtered_dominant_aspect.png"), aspect_direction_plot, width = 8, height = 5)
+# ggsave(here("data", "figures", "filtered_watershed_shape_part1.png"), watershed_shape_plot_1, width = 12, height = 8)
+# ggsave(here("data", "figures", "filtered_watershed_shape_part2.png"), watershed_shape_plot_2, width = 12, height = 8)
+# ggsave(here("data", "figures", "filtered_hydrology_combined.png"), combined_hydrology_plot, width = 14, height = 6)
+
+# Display the plots
+hydrology_topo_plot
+landcover_plot
+historical_climate_plot
+soil_properties_plot
+aspect_direction_plot
+northness_plot
+recent_climate_plot
+snow_duration_plot
+watershed_shape_plot_1
+watershed_shape_plot_2
+combined_climate_plot
+combined_hydrology_plot
+```
+
