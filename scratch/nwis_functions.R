@@ -180,3 +180,40 @@ fetchNHD_flowlines <- function(.data){
 
 # fetchNHD_flowlines(.data = sample_nwis_watersheds)
 
+# ----
+
+# load in the NHD as a table. This table lists all COMIDs in CONUS and allows you to "navigate" the NHD.
+nhd <- read_csv(here("data", "nhd_flow_network.csv"))
+
+# function to delineate each gage's watershed:
+# - gut check with better termination
+watershed_delineator <- function(site_list){
+  
+  # filter our master list to just the gage we are iterating over
+  site <- nwis_sites %>%
+    filter(site_no == site_list)
+  
+  # use get_UT to list all comids that are upstream of our gage using the comid the
+  # gage falls on:
+  upstream <- nhdplusTools::get_UT(nhd, site$comid)
+  
+  # grab all the catchments associated with the upstream comids:
+  nhd_catch <- nhdplusTools::get_nhdplus(comid = upstream,
+                                         realization = 'catchment',
+                                         t_srs = 4269) %>%
+    # remove dupes (precautionary step, not likely necessary)
+    dplyr::distinct(featureid, .keep_all=TRUE) %>%
+    # "dissolve" all the catchments into a single polygon
+    dplyr::summarize() %>% # this makes the watershed
+    # remove weird hole by-products that exist if the catchment boundaries don't
+    # line up perfectly:
+    nngeo::st_remove_holes() %>%
+    # tack on the state, site name, and comid to the watershed
+    dplyr::mutate(state = site$STUSPS,
+                  site_no = site$site_no,
+                  comid = site$comid)
+  
+  # return the delineated watershed
+  return(nhd_catch)
+  
+}

@@ -169,3 +169,37 @@ test_fetch <- fetchNHD_flowlines(.data = sample_nwis_watersheds)
 mapview(test_fetch) + mapview(sample_nwis_watersheds)
 ```
 
+# Basic gage stats
+
+```{r filter states of interest}
+states_oi <- c("Colorado", "Wyoming", "Utah", "Kansas")
+us_sf_object <- tigris::states() %>% 
+  filter(NAME %in% states_oi) 
+```
+
+```{r NWIS sites}
+# Get a list of NWIS sites for all of the states
+nwis_sites_by_state <- map(us_sf_object$STUSPS, 
+                           ~{
+                             discharge_sites <- whatNWISsites(stateCd = .x, parameterCd = "00060") %>% 
+                               filter(site_tp_cd == 'ST')
+                             
+                             small_enough <- readNWISsite(discharge_sites$site_no) %>%  
+                               mutate(drain_area_km = drain_area_va *  2.58999) %>%  
+                               filter(drain_area_km <= 1500)
+                             
+                             return(small_enough)
+                             }
+                           )
+
+nwis_sites <- bind_rows(nwis_sites_by_state) 
+```
+
+```{r}
+# average period of time that the gages have been around
+
+# how much data do they typically have
+
+# what is the distribution of catchment size for these watersheds
+```
+

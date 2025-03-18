@@ -1,0 +1,953 @@
+# Load Libraries 
+```{r}
+# To install StreamCatTools:
+# library(remotes)
+# install_github("USEPA/StreamCatTools", build_vignettes=FALSE)
+
+# To install climateR:
+# library(remotes)
+# remotes::install_github("mikejohnson51/AOI") # suggested!
+# remotes::install_github("mikejohnson51/climateR")
+
+packages <- c('tidyverse',
+              'sf',
+              'terra',
+              'elevatr', 
+              'dataRetrieval',
+              'nhdplusTools',
+              'StreamCatTools',
+              'tmap',
+              'climateR',
+              'data.table',
+              'mapview',
+              'here',
+              'furrr',
+              'nngeo',
+              'retry',
+              'units',
+              'FedData')
+
+# this package loader avoids unloading and reloading packages 
+package_loader <- function(x) {
+  if (!requireNamespace(x, quietly = TRUE)) {
+    install.packages(x)
+  }
+  require(x, character.only = TRUE)
+}
+
+lapply(packages, package_loader)
+```
+
+# read in new data
+```{r}
+## Initial gage pull via USGS
+nwis_sites <- read_rds(here("data", "nwis_sites_pull.rds")) %>% 
+  arrange(STUSPS) 
+
+## Initial filter of gages via USGS
+full_nwis_inventory <- read_rds(here("data", "nwis_inventory.rds"))
+
+data_filter_nwis_sites <- read_rds(here("data", "initial_filter_nwis_sites.rds")) %>% 
+  arrange(STUSPS)
+
+## Initial pull and filter of CDWR sites
+full_cdwr_inventory <- read_rds(here("data", "full_cdwr_sites.rds"))
+
+filtered_cdwr_sites <- read_rds(here("data", "filtered_cdwr_sites.rds"))
+
+## USGS and CDWR sites combined
+gage_sites <- read_rds(here("data", "usgs_cdwr_sites.rds")) %>% 
+  arrange(STUSPS)
+
+## Delineation area filter step
+gage_site_comid <- read_rds(here("data", "nwis_cdwr_gages_comid.RDS"))
+
+gage_site_comid_filtered <- read_rds(here("data", "filtered_nwis_cdwr_gages_comid.RDS"))
+
+watershed_polygons <- read_rds(here("data", "watershed_polygons.rds"))
+
+## Streamcat variable filter step
+streamcat_watersheds <- read_rds(here("data", "streamcat_watersheds.rds"))
+
+## Watershed div step
+all_flowlines <- read_rds(here("data", "all_flowlines.rds"))
+
+all_flowlines_list <- map(list.files(here("data", "flowlines2")), read_rds)
+
+watersheds_div <- read_rds(here('data', 'watersheds_div.rds'))
+
+## Final filter step
+filtered_transbasin_watersheds <- watersheds_div %>% 
+  filter(transbasin == "NATURAL")
+```
+
+# read in old CDWR and USGS sites
+```{r}
+# old_usgs_site_names <- list.files("/Users/juandlt_csu/Documents/streamflow_prediction/prediction_paper_original_work/CWCB_USGS_CDWR/Streamflow/Daily_USGS_2") %>% 
+#   map(~str_extract_all(.x, "\\d+")) %>% 
+#   unlist()
+# 
+# length(old_usgs_site_names)
+#   
+# old_cdwr_site_names <- list.files("/Users/juandlt_csu/Documents/streamflow_prediction/prediction_paper_original_work/CWCB_USGS_CDWR/Streamflow/Daily_CDWR") %>% 
+#   map(~str_remove(.x, "\\.mm_d\\.csv$")) %>% 
+#   unlist()
+# 
+# length(old_cdwr_site_names)
+
+old_site_names <- read_csv("/Users/juandlt_csu/Documents/streamflow_prediction/prediction_paper_original_work/CWCB_USGS_CDWR/CO_streamflow/Data/streamflow_observed.csv") %>% 
+  mutate(usgs_id = map_chr(str_extract_all(gageID, "\\d+"), ~ ifelse(length(.) == 0, NA, paste0(., collapse = ""))),
+         cdwr_id = map_chr(str_extract_all(gageID, "[a-zA-Z]"), paste0, collapse = "")) %>% 
+  select(usgs_id, cdwr_id, statname) 
+
+old_usgs_site_names <- pull(old_site_names, usgs_id) %>% 
+  keep(!is.na(.)) %>% 
+  compact() %>% 
+  unlist() %>% 
+  map(.x = ., ~str_pad(as.character(.x), 8, pad = "0")) %>% 
+  unlist()
+
+old_cdwr_site_names <- pull(old_site_names, cdwr_id) %>% compact() %>% keep(\(x) x!="")
+```
+
+Most all of the sites had CDWR analogs, there were very few that did not. 
+
+# Read in new CDWR sites
+```{r}
+# This pulls 2529 sites originally, and filters down to 197
+cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
+  httr::content(., as = "text", encoding = "UTF-8") %>%
+  jsonlite::fromJSON() %>%
+  .[["ResultList"]] 
+
+cdwr_sites_filtered <- cdwr_sites %>% 
+  # Apply those same filters that were applied to the USGS sites.
+  filter(year(startDate) <= 2000, # Started measuring by 1980
+         year(endDate) >= 2020, # Continued measuring for at least 30 years after 1980
+         # !is.na(usgsSiteId), # currently only keeping sites with USGS ids 
+         !is.na(longitude) & !is.na(latitude),
+         !(usgsSiteId %in% data_filter_nwis_sites$site_no), # Prevent duplicate sites from nwis sites
+         abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>% # Filter for stream gage types
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4269) %>% 
+  select(abbrev,
+         site_no = usgsSiteId,
+         station_nm = stationName) %>% 
+  mutate(site_pretty = paste0("USGS-", site_no),
+         agency_cd = "CDWR",
+         STUSPS = "CO") 
+```
+
+# Read in the nwis (usgs) sites that do not have the CDWR sites
+```{r}
+prior_filter_sites <- gage_sites %>% 
+  filter(!(site_no %in% cdwr_sites_filtered$site_no)) %>% 
+  pull(site_no)
+
+post_filter_nwis <- filtered_transbasin_watersheds %>% 
+  filter(!(site_no %in% cdwr_sites_filtered$site_no)) %>% 
+  pull(site_no)
+```
+
+# Find those sites that don't match between the two analyses
+```{r}
+# Overlap between old and new data sets
+used_old_site_names <- old_site_names %>% 
+  filter(usgs_id %in% gage_sites_filter$site_no | cdwr_id %in% cdwr_sites_filtered$site_no)
+
+write_csv(used_old_site_names, here("data", "new_old_overlap.csv"))
+
+# Old sites not present in new dataset
+unused_old_site_names <- old_site_names %>% 
+  anti_join(used_old_site_names, by = c("usgs_id", "cdwr_id"))
+
+write_csv(unused_old_site_names, here("data", "old_sites_not_in_new.csv"))
+
+# New sites not present in old dataset
+gage_sites_filter <- gage_sites %>% 
+  filter(site_no %in% filtered_transbasin_watersheds$site_no) %>% 
+  select(agency_cd, site_no, station_nm, STUSPS) %>% 
+  st_drop_geometry()
+
+new_sites_not_in_old <- gage_sites_filter %>% 
+  filter(!(site_no %in% old_site_names$usgs_id))
+
+write_csv(new_sites_not_in_old, here("data", "new_sites_not_in_old.csv"))
+```
+
+# Compare
+
+## Compare CDWR sites
+```{r}
+print(paste0("Percentage of old CDWR sites found in UNFILTERED CDWR data pull: ", 
+             (length(intersect(old_cdwr_site_names, cdwr_sites$abbrev))/length(old_cdwr_site_names)) * 100, "%"))
+
+print(paste0("Percentage of old CDWR sites found in FILTERED CDWR data pull: ", 
+             round((length(intersect(old_cdwr_site_names, cdwr_sites_filtered$abbrev))/length(old_cdwr_site_names)) * 100, 1), "%"))
+
+print(paste0("Percentage of FILTERED data found in old CDWR sites: ", 
+             round((length(intersect(cdwr_sites_filtered$abbrev, old_cdwr_site_names)) / length(cdwr_sites_filtered$abbrev)) * 100, 1), "%"))
+
+print(paste0("Length of old CDWR data: ", length(old_cdwr_site_names)))
+
+print(paste0("Length of new CDWR data: ", length(cdwr_sites_filtered$abbrev)))
+```
+
+1. Unfiltered dataset completely encompasses the old dataset. All historical sites are present before filtering
+
+2. 22.5\% of old CDWR sites found in FILTERED data pull. 
+- After filtering we retain about a quarter of the original sites.
+
+3. 38.2\% of FILTERED data found in old CDWR sites
+- Some historical sites are in the filtered data, but its mostly new sites that 
+weren't in the old data set
+
+The filtering has changed the composition of the dataset from the original sites. 
+All the while, we have also increased the overall number of cdwr sites by 68 sites. 
+
+## Compare USGS sites (prior to watershed delineation)
+```{r}
+# Percentage of old USGS sites found in new raw USGS sites 
+## Here unfiltered means those sites that were only filtered for size of the drainage area
+print(paste0("Percentage of old USGS sites found in UNFILTERED USGS NWIS data pull: ", 
+             round((length(intersect(old_usgs_site_names, nwis_sites$site_no))/length(old_usgs_site_names)) * 100, 1), 
+             "%"))
+
+# Percentage of old USGS sites found in new filtered USGS sites
+## Here filterd means those sites that were filtered for 'DAILY' data type,
+## and at least 30 years of data (not necessarily continuous)
+print(paste0("Percentage of old USGS sites found in FILTERED USGS NWIS data pull: ",
+             round((length(intersect(old_usgs_site_names, data_filter_nwis_sites$site_no))/length(old_usgs_site_names))*100, 1),
+      "%"))
+
+# Percentage of FILTERED data found in old USGS sites
+print(paste0("Percentage of FILTERED USGS NWIS data found in old USGS sites: ",
+             round((length(intersect(data_filter_nwis_sites$site_no, old_usgs_site_names))/length(data_filter_nwis_sites$site_no))*100, 1),
+      "%"))
+
+print(paste0("Length of old USGS data: ", length(old_usgs_site_names)))
+
+print(paste0("Length of new USGS data: ", length(data_filter_nwis_sites$site_no)))
+
+print(paste0("Length of new USGS data that does not overlap with the old data:", length(!(old_usgs_site_names %in% data_filter_nwis_sites$site_no))))
+```
+1. Unfiltered NWIS dataset contains most, but not all historical USGS sites.
+
+2. Filtering retains a significant portion of historical sites.
+
+3. Filtered dataset is mostly comprised of new sites.
+
+The filtering has changed the composition of the dataset from the original sites.
+We have increased the overall number of USGS sites by 143 sites. 
+
+## Compare USGS sites (post watershed delineation)
+```{r}
+# Percentage of old USGS sites found in new raw USGS sites 
+## Here unfiltered means those sites that were only filtered for size of the drainage area
+print(paste0("Percentage of old USGS sites found in UNFILTERED USGS NWIS data pull: ", 
+             round((length(intersect(old_usgs_site_names, post_filter_nwis))/length(old_usgs_site_names)) * 100, 1), 
+             "%"))
+
+# Percentage of old USGS sites found in new filtered USGS sites
+## Here filterd means those sites that were filtered for 'DAILY' data type,
+## and at least 30 years of data (not necessarily continuous)
+print(paste0("Percentage of old USGS sites found in FILTERED USGS NWIS data pull: ",
+             round((length(intersect(old_usgs_site_names, post_filter_nwis))/length(old_usgs_site_names))*100, 1),
+      "%"))
+
+# Percentage of FILTERED data found in old USGS sites
+print(paste0("Percentage of FILTERED USGS NWIS data found in old USGS sites: ",
+             round((length(intersect(post_filter_nwis, old_usgs_site_names))/length(post_filter_nwis))*100, 1),
+      "%"))
+
+print(paste0("Length of old USGS data: ", length(old_usgs_site_names)))
+
+print(paste0("Length of new USGS data: ", length(post_filter_nwis)))
+```
+
+
+## Compare combination of new sites with the combination of the old sites
+```{r}
+# All sites together
+print("All sites:")
+print(paste0("Total number of old sites: ", nrow(old_site_names)))
+print(paste0("Total number of new sites: ", nrow(filter(nwis_sites, !(site_no %in% old_usgs_site_names)))))
+print(paste0("New sites altogether: ", nrow(filter(nwis_sites, !(site_no %in% old_usgs_site_names)))-nrow(old_site_names)))
+
+print("<<<<>>>>")
+
+# CO specific filter
+co_nwis_sites <- filter(nwis_sites, STUSPS == "CO")
+print("CO filter:")
+print(paste0("Total number of old sites: ", nrow(old_site_names)))
+print(paste0("Total number of new sites: ", nrow(filter(co_nwis_sites, !(site_no %in% old_usgs_site_names)))))
+print(paste0("New sites altogether: ", nrow(filter(co_nwis_sites, !(site_no %in% old_usgs_site_names)))-nrow(old_site_names)))
+
+```
+
+# Make map of old sites and new sites (just the ones that have the USGS site number...)
+
+## Get the old sites coords and comids
+```{r}
+old_gage_meta <- dataRetrieval::whatNWISdata(siteNumber = old_usgs_site_names, parameterCd = "00060") %>% 
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
+
+old_inventory <- old_gage_meta %>% 
+  dplyr::left_join(pcodes, by = "parm_cd") %>%
+  dplyr::select(c(site_name = station_nm,
+                  site_no,
+                  data_type_cd,
+                  site_type_cd = site_tp_cd,
+                  n_obs = count_nu,
+                  begin_date,
+                  end_date,
+                  parameter = parameter_name_description,
+                  code = parm_cd))
+
+old_inventory <- left_join(old_inventory, table, by = 'site_type_cd') %>%
+  mutate(data_type = case_when(data_type_cd == "dv" ~ "Daily",
+                               data_type_cd == "uv" ~ "Unit",
+                               data_type_cd == "qw" ~ "Water Quality",
+                               data_type_cd == "gw" ~ "Groundwater Levels",
+                               data_type_cd == "iv" ~ "Unit",
+                               data_type_cd == "sv" ~ "Site Visits",
+                               data_type_cd == "pk" ~ "Peak Measurements",
+                               data_type_cd == "ad" ~ "USGS Annual Water Data Report",
+                               data_type_cd == "aw" ~ "Active Groundwater Level Network",
+                               data_type_cd == "id" ~ "Historic Instantaneous"),
+         site_pretty = paste0("USGS-",site_no))
+
+old_inventory_filtered <- old_inventory %>%
+  filter(data_type == "Daily",
+         year(begin_date) <= 1980,  # Started measuring by 1980
+         year(end_date) >= 2010, # Continued measuring for at least 30 years after 1980
+         n_obs >= 365*30) # Has at least 30 years of observations
+
+# Old inventory comid ----
+comid_old_inventory <- old_inventory %>% 
+  rowwise() %>%
+  mutate(
+    # first try to get comid using nldi ("verified" correct comid - or at least what USGS says it is)
+    comid = possibly(
+      function(x) {
+        result <- try(get_nldi_feature(list(featureSource = "nwissite", featureID = x))$comid, silent = TRUE)
+        if (inherits(result, "try-error") | is.null(result)) NA_character_ else result
+      },
+      otherwise = NA_character_,
+      quiet = TRUE)(site_pretty),
+    # get the comid using the weirdos' coordinates instead of their gage name
+    comid_coords = {
+                             result <- try(discover_nhdplus_id(geometry), silent = TRUE)
+                             # Check if the try() resulted in an error
+                             if (inherits(result, "try-error")) NA else result}) %>% 
+  ungroup()
+
+comid_old_inventory <- comid_old_inventory %>% 
+  mutate(comid_new = ifelse(is.na(comid), comid_coords, comid),
+         STUSPS = "CO") %>% 
+  filter(comid_coords == comid) %>% 
+  select(STUSPS, site_no, station_nm = site_name, comid = comid_new) %>% 
+  mutate(comid = as.numeric(comid))
+  
+
+# Old inventory filtered comid ----
+comid_old_inventory_filtered <- old_inventory_filtered %>% 
+  rowwise() %>%
+  mutate(
+    # first try to get comid using nldi ("verified" correct comid - or at least what USGS says it is)
+    comid = possibly(
+      function(x) {
+        result <- try(get_nldi_feature(list(featureSource = "nwissite", featureID = x))$comid, silent = TRUE)
+        if (inherits(result, "try-error") | is.null(result)) NA_character_ else result
+      },
+      otherwise = NA_character_,
+      quiet = TRUE)(site_pretty),
+    # get the comid using the weirdos' coordinates instead of their gage name
+    comid_coords = {
+                             result <- try(discover_nhdplus_id(geometry), silent = TRUE)
+                             # Check if the try() resulted in an error
+                             if (inherits(result, "try-error")) NA else result}) %>% 
+  ungroup()
+
+comid_old_inventory_filtered <- comid_old_inventory_filtered %>% 
+  mutate(comid_new = ifelse(is.na(comid), comid_coords, comid),
+         STUSPS = "CO") %>% 
+  filter(comid_coords == comid) %>% 
+  select(STUSPS, site_no, station_nm = site_name, comid = comid_new) %>% 
+  mutate(comid = as.numeric(comid))
+```
+
+## Delineate the old gages
+```{r}
+# Old watersheds ----
+old_watersheds <- pmap(comid_old_inventory, safely(watershed_delineator), .progress = TRUE) %>% 
+  transpose() %>%  # Separate results and errors
+  pluck(1) %>%  # Extract results
+  compact() %>% # Remove NULL results
+  bind_rows() # Combine into a single data frame
+
+mapview(old_watersheds)
+
+# Old watersheds from the inventory list that was filtered ----
+old_filtered_watersheds <- pmap(comid_old_inventory_filtered, safely(watershed_delineator), .progress = TRUE) %>% 
+  transpose() %>%  # Separate results and errors
+  pluck(1) %>%  # Extract results
+  compact() %>% # Remove NULL results
+  bind_rows() # Combine into a single data frame
+
+mapview(old_filtered_watersheds)
+
+mapview(watersheds_div)
+```
+
+## Find reference old watersheds
+```{r}
+# This is what's available on StreamCat related to lithology. Likely not identical to what
+# was used by Abby but hopefully good swap:
+lithology_vars <- c("pctalkintruvol", "pctwater",
+                    "pctsilicic", "pctsallake",    
+                    "pctnoncarbresid", "pcthydric",      
+                    "pctglactilloam", "pctglactilcrs",  
+                    "pctglactilclay", "pctglaclakefine",
+                    "pctglaclakecrs", "pctextruvol",   
+                    "pcteolfine", "pcteolcrs",      
+                    "pctcolluvsed", "pctcoastcrs",    
+                    "pctcarbresid")
+                    # "pctalluvocoast" is giving me issues
+
+# Urban cover (add all together to get percent of total urban cover): 
+# Many available years. Which do we want to use? For now using 2011:
+urban_cover <- c("pcturbop2019", "pcturbmd2019", "pcturblo2019", "pcturbhi2019")
+
+# PRISM mean precip for 1981-2010 OR 1991-2020
+prism_precip <- c("precip8110", "precip9120")
+
+# These are all the variables Fred was interested in for describing flow
+# in his work. Likely a good starting point for our needs, too. 
+fred_vars <- c("canaldens", 
+               # BFI
+               "bfi", 
+               #NLCD 2019
+               "pctow2019", "pctice2019", "pcturbop2019", "pcturblo2019", "pcturbmd2019", "pcturbhi2019",
+               "pctbl2019", "pctdecid2019", "pctconif2019", "pctmxfst2019", "pctshrb2019", "pctgrs2019",
+               "pcthay2019", "pctcrop2019", "pctwdwet2019", "pcthbwet2019",
+               # Dam Info
+              "damdens", "damnidstor", "damnrmstor",
+               # Elevation
+               "elev", 
+               # Impervious Surfaces across a bunch of years:
+               "pctimp2006", "pctimp2008", "pctimp2011", "pctimp2001",
+               "pctimp2013", "pctimp2019", "pctimp2016", "pctimp2004",
+               # PRISM 1991-2020
+               "precip9120", "tmax9120", "tmean9120", "tmin9120",
+               # STATSGO variables:
+               "clay", "sand", "wtdep", "om", "perm", "rckdep") # "silt" is giving me issues
+
+# Old watersheds ----
+
+
+# Old watersheds from the inventory list that was filtered ----
+old_streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(c(lithology_vars, urban_cover, prism_precip, fred_vars), collapse = ","),
+                                      aoi = 'watershed', 
+                                      comid = old_filtered_watersheds$comid) %>%
+  # remove variables we don't particularly care about that get returned:
+  select(-contains("AREASQKM"))
+
+old_filtered_watersheds_streamcat <- old_filtered_watersheds %>% 
+  left_join(streamcat_vars, by = 'comid') %>% 
+  mutate(pcturb2019ws = pcturbhi2019ws + pcturbmd2019ws + pcturblo2019ws + pcturbop2019ws)
+
+ref_old_watersheds <- old_filtered_watersheds_streamcat %>% 
+  mutate(area = units::set_units(sf::st_area(.), km^2)) %>% 
+  filter(pcturb2019ws < 10,
+         damnidstorws < 100000,
+         as.numeric(area) <= 1600) 
+```
+
+## making sure that ref_old_watersheds are all being tracked by the new system:
+```{r}
+all(ref_old_watersheds$site_no %in% watersheds_div$site_no)
+```
+
+## Check if the old watersheds are getting wiped out during the flowline test
+```{r}
+# open the nhd_hr - which contains a bunch of layers ----
+nhd_hr <- arcgislayers::arc_open("https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer")
+nhd_hr_flowlines <- arcgislayers::get_layer(nhd_hr, 3)
+
+# Retry wrapper for arc_select ----
+retry_arc_select <- function(nhd_flowlines, filter_geom_arg, crs_arg, site_info = "", max_attempts = 5) {
+  for (attempt in 1:max_attempts) {
+    
+    result <- tryCatch({
+      message("Attempt ", attempt, " for ", site_info)
+      arcgislayers::arc_select(
+        nhd_flowlines, 
+        filter_geom = filter_geom_arg,
+        crs = crs_arg)
+    }, error = function(e) {
+      message("\nAttempt ", attempt, " failed for ", site_info, ": ", e$message, "\n")
+      NULL
+    })
+    
+    if (!is.null(result)) return(result)
+    
+    # Exponential backoff with some randomness to prevent concurrent requests
+    wait_time <- 2^attempt + runif(1, 0, 1)
+    message("\nWaiting ", round(wait_time, 1), " seconds before retry...")
+    Sys.sleep(wait_time)  # Wait before retrying
+  }
+  message("\nAll attempts failed for ", site_info)
+  return(NULL)
+}
+
+# fetch flowlines function ----
+fetch_flowlines <- function(site_no, STUSPS, geometry, nhd_flowlines = nhd_hr_flowlines){ 
+
+  site_info <- paste0(site_no, " (", STUSPS, ")")
+  message("\nProcessing site: ", site_info)
+  
+  # Buffer the watershed geometry and handle errors ----
+  # Convert geometry to sfc and set CRS before buffering
+  watershed_aoi <- tryCatch({
+    # Ensure geometry is handled properly
+    if(inherits(geometry, "sfc")) {
+      geom_with_crs <- geometry
+    } else {
+      geom_with_crs <- st_sfc(geometry, crs = 4269)
+    }
+    
+    st_buffer(geom_with_crs, 1000)
+  }, error = function(e) {
+    message("Couldn't create watershed AOI for ", site_info)
+    return(NULL)
+  })
+  
+  if (is.null(watershed_aoi)) {
+    message("Couldn't create watershed AOI for ", site_info)
+    return(NULL)
+  }
+  
+  arc_search_result <- retry_arc_select(
+    nhd_flowlines, 
+    filter_geom_arg = watershed_aoi, 
+    crs_arg = st_crs(watershed_aoi),
+    site_info = site_info
+    )
+  
+  if (is.null(arc_search_result) || nrow(arc_search_result) == 0) {
+      message("\nNo flowlines found for site ", site_info)
+      return(NULL)
+    }
+  
+  # Process and classify flowlines
+  flowlines <- tryCatch({
+    arc_search_result %>%
+      st_make_valid() %>%
+      dplyr::distinct() %>%
+      mutate(
+        flowline_type = case_when(
+          ftype == 460 ~ "natural",
+          ftype == 558 ~ "artificial path",
+          ftype == 468 ~ "drainageway",
+          ftype == 336 ~ "canal ditch",
+          ftype == 566 ~ "coastline",
+          ftype == 334 ~ "connector",
+          ftype == 428 ~ "pipeline",
+          ftype == 420 ~ "underground conduit",
+          .default = "unnatural"
+        ),
+        site_no = site_no,
+        STUSPS = STUSPS
+      )
+  }, error = function(e) {
+    message("\nError processing flowlines for ", site_info, ":", e$message)
+    return(NULL)
+  })
+  
+  return(flowlines)
+}
+
+# First test with a single site to ensure the function works
+message("\n=== Testing with a single site ===")
+single_test <- fetch_flowlines(
+  site_no = ref_old_watersheds$site_no[6],
+  STUSPS = ref_old_watersheds$STUSPS[6],
+  geometry = ref_old_watersheds$geometry[6],
+  nhd_flowlines = nhd_hr_flowlines
+)
+
+# Set up parallel processing ----
+
+# Set up parallel processing with fewer workers to reduce server load
+num_workers <- min(availableCores() - 1, 3) # Use at most 4 workers
+message("Setting up parallel processing with ", num_workers, " workers")
+plan(multisession, workers = num_workers)
+
+# Explicitly export the nhd_hr_flowlines object to workers
+furrr_options(
+  globals = TRUE,
+  packages = c("dplyr", "sf", "arcgislayers")
+)
+
+# Select the data we need 
+site_data <- ref_old_watersheds %>% 
+  select(site_no, STUSPS, geometry)
+
+# Process in chunks to reduce memory pressure and server load
+chunk_size <- 10
+total_sites <- nrow(site_data)
+chunks <- split(1:total_sites, ceiling(seq_along(1:total_sites) / chunk_size))
+
+all_results <- list()
+all_successful <- list()
+
+for (chunk_idx in seq_along(chunks)) {
+  
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(chunks), " ===")
+  
+  # Get the indices for this chunk
+  indices <- chunks[[chunk_idx]]
+  chunk_data <-site_data[indices, ]
+  
+  # Process this chunk in parallel
+  chunk_results <- future_pmap(
+    list(
+      site_no = chunk_data$site_no,
+      STUSPS = chunk_data$STUSPS,
+      geometry = chunk_data$geometry
+    ),
+    safely(function(site_no, STUSPS, geometry){
+      fetch_flowlines(site_no, STUSPS, geometry, nhd_flowlines = nhd_hr_flowlines)
+    }),
+    .progress = TRUE
+  )
+  
+  # Progress chunk results
+  chunk_transposed <- transpose(chunk_results)
+  chunk_successful <- chunk_transposed %>% pluck(1) %>% compact()
+  chunk_errors <- chunk_transposed %>% pluck(2) %>% compact()
+  
+  # Print diagnostics for this chunk
+  message("Chunk ", chunk_idx, ": ", length(chunk_successful), " successful, ", 
+          length(chunk_errors), " errors")
+  
+  # Add successful results to our collection
+  all_successful <- c(all_successful, chunk_successful)
+  all_results <- c(all_results, chunk_results)
+  
+  # Take a short break between chunks to avoid overloading the server with parallel requests
+  if (chunk_idx < length(chunks)) {
+      message("Taking a short break before next chunk...")
+      Sys.sleep(5)
+    }
+    
+}
+
+# Process final results ----
+results_transposed <- transpose(all_results)
+successful_results <- results_transposed %>% pluck(1) %>% compact()
+errors <- results_transposed %>% pluck(2) %>% compact()
+
+# Print diagnostics
+message("\n=== Processing complete ===")
+message("Number of successful results: ", length(successful_results))
+message("Number of errors: ", length(errors))
+
+if (length(errors) > 0) {
+  message("First few error messages:")
+  for (i in 1:min(3, length(errors))) {
+    message(as.character(errors[[i]]))
+  }
+}
+
+# Save individual flowlines
+walk(successful_results, function(df) {
+  site <- unique(df$site_no)
+  state <- unique(df$STUSPS)
+  write_rds(df, here("data", "test_old_flowlines", paste0(state, "_", site, ".RDS")))
+})
+```
+
+```{r}
+# === I am here! ====
+# Tomorrow: Check to see if the old sites get knocked out by transbasin diversions
+
+transbasin_finder <- function(site_no, site_data = ref_old_watersheds) {
+
+  # Filter our master list to just the gage watershed we are iterating over ----
+  site <- site_data %>% 
+    filter(site_no == !!site_no)
+  
+  if (nrow(site) == 0) {
+    message("\nSite ", site_no, " not found in reference data")
+    return(NULL)
+  }
+  
+  # Create a descriptive identifier for messaging ----
+  site_info <- paste0(site_no, " (", site$STUSPS, ")")
+  message("\nProcessing ", site_info)
+  
+  # Try to read the flowline file ----
+  flowlines_path <- here("data", "flowlines2", paste0(site$STUSPS, "_", site$site_no, ".RDS"))
+  
+  ## Error handling
+  if(!file.exists(flowlines_path)) {
+    message("\nFlowline file not found for ", site_info,)
+    return(NULL)
+  }
+  
+  flowlines <- tryCatch({
+    read_rds(flowlines_path)
+  }, error = function(e) {
+    message("Error reading flowlines for ", site_info, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(flowlines) | (is.data.frame(flowlines) & nrow(flowlines) == 0)) {
+    message(site_info, " has no flowlines data")
+    return(NULL)
+  }
+  
+  # Filter for unnatural flowlines ----
+  flowlines_unnatural <- tryCatch({
+    flowlines %>% 
+      filter(flowline_type != "natural")
+  }, error = function(e) {
+    message("Error filtering unnatural flowlines for ", site_info, ": ", e$message)
+    return(NULL)
+  })
+  
+  # Process watershed geometry ----
+  watershed_processed <- tryCatch({
+    # For linestring transformation to work, watershed must be a polygon
+    site_geom <- site
+    
+    if (st_geometry_type(site_geom)[1] != "POLYGON") { # TODO: why do we have to specify [1] here?
+      # Cast to Polygon (may create multiple features)
+      site_geom <- st_cast(site_geom, "POLYGON")
+    }
+    
+    # Create polyline from the boundary
+    polyline <- site_geom %>% st_cast("LINESTRING")
+    
+    # Check for unnatural crossovers
+    crossovers <- 0
+    if (nrow(flowlines_unnatural) > 0) {
+      # Spatial intersection to find crossovers
+      crossovers <- flowlines_unnatural %>%
+        st_intersection(polyline) %>%
+        nrow()
+    }
+    
+    # Process result
+    site_geom %>% 
+      group_by(site_no, comid) %>% 
+      summarize(.groups = "drop") %>%
+      mutate(transbasin = ifelse(crossovers > 0, "TRANSBASIN_DIVERSION", "NATURAL"))
+    
+  }, error = function(e) {
+    message("Error in spatial analysis for ", site_info, ": ", e$message)
+    return(NULL)
+  })
+  
+  ## Error handling
+  if (is.null(watershed_processed)) {
+    return(NULL)
+  }
+  
+  # Create visualization of watershed and flowlines ----
+  tryCatch({
+    # Extract the bounding box
+    bbox_site <- st_bbox(watershed_processed)
+    
+    # Create the ggplot map
+    gg_map <- ggplot() +
+      # Plot the watershed
+      geom_sf(data = watershed_processed, color = "black", fill = "white", size = 1) + 
+      # Plot the site point (with safe filtering)
+      {
+        site_point <- nwis_sites %>% filter(site_no == site$site_no)
+        if (nrow(site_point) > 0) {
+          geom_sf(data = site_point, color = "lightblue", size = 5.5)
+        }
+      } +
+      # Plot all flowlines in blue
+      geom_sf(data = flowlines, color = "blue", size = 0.5) + 
+      # Plot unnatural flowlines in red (if they exist)
+      {
+        if (nrow(flowlines_unnatural) > 0) {
+          geom_sf(data = flowlines_unnatural, color = "red", size = 2)
+        }
+      } +
+      # Set map extents
+      xlim(bbox_site["xmin"], bbox_site["xmax"]) +
+      ylim(bbox_site["ymin"], bbox_site["ymax"]) +
+      coord_sf() + 
+      theme_void() +
+      labs(title = paste0(site$site_no, " ", watershed_processed$transbasin[1])) +
+      theme(
+        plot.title = element_text(size = 14, hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+      )
+    
+    # Create output directory if it doesn't exist
+    dir.create(here("data", "test_old_transbasin_confirm"), showWarnings = FALSE, recursive = TRUE)
+    
+    # Save the map as an image
+    output_file <- here("data", "test_old_transbasin_confirm", 
+                        paste0(watershed_processed$transbasin[1], "_", 
+                               site$STUSPS, "_", site$site_no, ".png"))
+    
+    ggsave(output_file, plot = gg_map, width = 8, height = 6, dpi = 100)
+    message("Successfully created visualization for ", site_info)
+    
+  }, error = function(e) {
+    message("Error creating visualization for ", site_info, ": ", e$message)
+    # Return watershed data even if visualization fails
+  })
+  
+  message("Completed processing for ", site_info)
+  return(watershed_processed)
+  
+}
+
+# Test the function on a single site first ----
+test_site <- ref_old_watersheds$site_no[1]
+message("Testing with site ", test_site)
+test_result <- transbasin_finder(test_site)
+
+# Set up parallel processing ----
+
+# Set up parallel processing with fewer workers to reduce server load
+num_workers <- min(availableCores() - 1, 8) # Use at most 8 workers
+message("Setting up parallel processing with ", num_workers, " workers")
+plan(multisession, workers = num_workers)
+
+# Explicitly export the nhd_hr_flowlines object to workers
+furrr_options(
+  globals = TRUE,
+  packages = c("dplyr", "sf", "ggplot2", "readr", "here")
+)
+
+# Chunk the data and run it through `transbasin_finder()` ----
+
+# Get site numbers to process
+site_numbers <- ref_old_watersheds$site_no
+total_sites <- length(site_numbers)
+
+# Process in chunks to reduce memory pressure
+chunk_size <- 20
+total_sites <- nrow(site_numbers)
+chunks <- split(site_numbers, ceiling(seq_along(site_numbers) / chunk_size))
+
+# Process each chunk
+old_transbasin_finder_results <- list()
+
+for (chunk_idx in seq_along(chunks)) {
+  message("=== Processing chunk ", chunk_idx, " of ", length(chunks))
+  
+  # Get the sites for this chunk
+  chunk_sites <- chunks[[chunk_idx]]
+  
+  # Process this chunk in parallel
+  chunk_results <- future_map(
+    chunk_sites,
+    safely(function(site_no){
+      transbasin_finder(site_no)
+    }),
+    .progress = TRUE
+  )
+  
+  # Extract successful results
+  chunk_successful <- chunk_results %>% 
+    transpose() %>% 
+    pluck(1) %>% 
+    compact()
+  
+  message("Chunk ", chunk_idx, ": Processed ", length(chunk_successful), 
+            " sites successfully out of ", length(chunk_sites))
+  
+  # Add successful results to our collection
+  old_transbasin_finder_results <- c(old_transbasin_finder_results, chunk_successful)
+  
+  # Pause between chunks
+  if (chunk_idx < length(chunks)) {
+      message("Taking a short break before the next chunk...")
+      Sys.sleep(2)
+    }
+}
+
+# Combine the final results ----
+if (length(old_transbasin_finder_results) > 0) {
+  
+  old_watersheds_div <- old_transbasin_finder_results %>% 
+    compact() %>% 
+    bind_rows() %>% 
+    st_make_valid()
+  
+  # Save the final results
+  # write_rds(watersheds_div, here("data", "watersheds_div.RDS"))
+  
+  # Create a summary of results
+  old_transbasin_summary <- old_watersheds_div %>%
+    st_drop_geometry() %>%
+    count(transbasin) %>%
+    mutate(percentage = n / sum(n) * 100)
+  
+  message("\n=== Processing complete ===")
+  message("Total watersheds processed: ", nrow(old_watersheds_div))
+  message("Transbasin summary:")
+  print(old_transbasin_summary)
+}
+
+# Reduce old reference gages to only gages without a transbasin diversion
+filtered_old_ref_watersheds <- old_watersheds_div %>% 
+  filter(transbasin == "NATURAL")
+
+# Check to see that all the gages that are in filtered_old_ref_watersheds is in the new watersheds:
+all(filtered_old_ref_watersheds$site_no %in% filtered_ref_watersheds$site_no)
+```
+
+```{r}
+## Watershed div step
+watersheds_div <- read_rds(here('data', 'watersheds_div.rds'))
+
+## Final filter step
+filtered_transbasin_diversions <- watersheds_div %>% 
+  filter(transbasin == "TRANSBASIN_DIVERSION")
+
+mapview(filtered_transbasin_diversions) +
+  mapview(co_transbasinstations) +
+  mapview(filtered_transbasin_watersheds)
+```
+
+```{r}
+flowline_sample_name <- list.files(here("data", "flowlines2"), full.names = T)[1]
+flowline_sample <- read_rds(flowline_sample_name) %>% 
+  mutate(
+        # Classify each flowline based on its feature type code (ftype)
+        flowline_type = case_when(
+          ftype == 460 ~ "natural",             # Natural streams/rivers
+          ftype == 558 ~ "artificial path",     # Artificial flowpaths through waterbodies
+          ftype == 468 ~ "drainageway",         # Constructed drainage features
+          ftype == 336 ~ "canal ditch",         # Human-made canals and ditches
+          ftype == 566 ~ "coastline",           # Coastline features
+          ftype == 334 ~ "connector",           # Artificial connectors in network
+          ftype == 428 ~ "pipeline",            # Underground or above-ground pipes
+          ftype == 420 ~ "underground conduit", # Subsurface flow paths
+          .default = "unnatural"                # Any other types default to unnatural
+        ))
+
+
+watershed_name <- list.files(here("data", "watersheds"), full.names = T)[1]
+watershed_sample <- read_rds(watershed_name)
+```
+
+```{r}
+mapview(flowline_sample, zcol = "flowline_type") +
+  mapview(transbasin_pts, color = "red") +
+  mapview(watershed_sample) +
+  mapview(filter(nwis_sites, site_no == "06614800"))
+```
+
