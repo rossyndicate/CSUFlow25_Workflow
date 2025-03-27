@@ -6,7 +6,7 @@
 # Load packages required to define the pipeline:
 library(targets)
 library(tarchetypes)
-library(clustermq)
+# library(clustermq)
 
 # Set target options:
 tar_option_set(
@@ -24,7 +24,7 @@ tar_source(files = c(
   "3_model_evaluation_workflow.R"))
 
 # Replace the target list below with your own:
-list(
+config_targets <- list(
   tar_target(
     name = data,
     command = tibble(x = rnorm(100), y = rnorm(100))
@@ -35,3 +35,7 @@ list(
     command = coefficients(lm(y ~ x, data = data))
   )
 )
+
+# Full targets list
+c(config_targets,
+  site_selection_targets_list)
