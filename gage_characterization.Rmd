@@ -55,42 +55,26 @@ options(future.rng.onMisuse = "ignore")
 
 # Load data that's already been run
 ```{r}
-## Initial gage pull via USGS
-nwis_sites <- read_rds(here("data", "nwis_sites_pull.rds")) %>% 
-  arrange(STUSPS) 
-
-## Initial filter of gages via USGS
-full_nwis_inventory <- read_rds(here("data", "nwis_inventory.rds"))
-
-data_filter_nwis_sites <- read_rds(here("data", "initial_filter_nwis_sites.rds")) %>% 
-  arrange(STUSPS)
-
-## Initial pull and filter of CDWR sites
+# USGS and CDWR sites data
+nwis_sites <- read_rds(here("data", "nwis_sites_pull.rds"))
+nwis_inventory <- read_rds(here("data", "nwis_inventory.rds"))
+initial_filter_nwis_sites <- read_rds(here("data", "initial_filter_nwis_sites.rds"))
 full_cdwr_inventory <- read_rds(here("data", "full_cdwr_sites.rds"))
-
 filtered_cdwr_sites <- read_rds(here("data", "filtered_cdwr_sites.rds"))
+usgs_cdwr_sites <- read_rds(here("data", "usgs_cdwr_sites.rds"))
 
-## USGS and CDWR sites combined
-gage_sites <- read_rds(here("data", "usgs_cdwr_sites.rds")) %>% 
-  arrange(STUSPS)
-
-## Delineation area filter step
+# Sites with COMID information
 gage_site_comid <- read_rds(here("data", "nwis_cdwr_gages_comid.RDS"))
-
 gage_site_comid_filtered <- read_rds(here("data", "filtered_nwis_cdwr_gages_comid.RDS"))
 
+# Watershed polygons and StreamCAT data
 watershed_polygons <- read_rds(here("data", "watershed_polygons.rds"))
-
-## Streamcat variable filter step
 streamcat_watersheds <- read_rds(here("data", "streamcat_watersheds.rds"))
-
-ref_watersheds <- read_rds(here("data", "streamcat_watersheds.rds"))
+reference_watersheds <- read_rds(here("data", "reference_watersheds.rds"))
 
 ## Watershed div step
 all_flowlines <- read_rds(here("data", "all_flowlines.rds"))
-
 all_flowlines_list <- map(list.files(here("data", "flowlines2"), full.names = T), ~read_rds(.x))
-
 watersheds_div <- read_rds(here('data', 'watersheds_div.rds'))
 
 # Hard code the previous sites with USGS gages into this analysis
@@ -281,18 +265,6 @@ new_data_gages <- inventory %>%
   filter(n_obs >= expected_days_in_operation) %>%  # Has continual observations
   bind_rows(old_inventory) # Bind with old data
 
-# data_gap_gages <- inventory %>%
-#   filter(data_type == "Daily", # Daily data type
-#          year(end_date) >= 2024) %>%  # Continued measuring at least until 2024
-#   mutate(years_in_operation = year(end_date)-year(begin_date),
-#          minimum_days_in_operation  = round(((year(end_date)-year(begin_date))*365)*0.6)) %>%
-#   filter(n_obs >= minimum_days_in_operation, # Data should be recorded at least 60% of the time
-#          !(site_no %in% new_data_gages$site_no)) # Avoid overlap from data gages that we are already using
-#
-# write_rds(data_gap_gages, here("data", "data_gap_gages.rds"))
-
-# Only keep gages with data during or after 1980:
-# down from 2525 to 303 sites, and drops all of the original sites
 data_filter_nwis_sites <- nwis_sites %>%
   mutate(drain_area_km = drain_area_va *  2.58999) %>%
   filter(site_no %in% new_data_gages$site_no,
@@ -308,7 +280,6 @@ gc()
 
 Grab CO DWR gages
 ```{r, eval = FALSE}
-# This pulls 2529 sites originally, and filters down to 197
 cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
   httr::content(., as = "text", encoding = "UTF-8") %>%
   jsonlite::fromJSON() %>%
@@ -369,7 +340,6 @@ comid for the stream feature each gage is associated with.
 **DANGER: YOU WILL NEED TO CONFIRM THE APPROPRIATE FLOWLINE IS SELECTED FOR EVERY GAGE. THERE IS NO WAY TO CONFIRM THEY ARE RIGHT WITHOUT EYEBALLING THEM!**
 
 ```{r}
-# TODO: parallelize this step
 gage_sites <- gage_sites %>%
   rowwise() %>%
   mutate(
@@ -583,7 +553,6 @@ watershed_delineator <- function(STUSPS, site_no, station_nm, comid, geometry) {
 
 # Single site test ----
 test_site_no <- "10172200"
-test_site_no <- "06716100"
 test_site <- filter(gage_sites, site_no == test_site_no)
 test_watershed_delineator <- watershed_delineator(
   STUSPS = gage_sites$STUSPS[[which(gage_sites$site_no == test_site_no)]],
@@ -665,7 +634,8 @@ for (chunk_idx in seq_along(chunks)) {
 
 # Process final results ----
 watersheds <- watershed_delineator_results %>% 
-  bind_rows()
+  bind_rows() %>% 
+  left_join(st_drop_geometry(select(gage_sites, site_no, comid, abbrev)), by = c("site_no", "comid"))
 
 # Save watershed dataframe
 write_rds(watersheds, here("data", "watershed_polygons.RDS"))
@@ -726,10 +696,13 @@ streamcat_watersheds <- watersheds %>%
   left_join(., streamcat_vars, by = "comid") %>%
   mutate(pcturb2019ws = pcturbhi2019ws + pcturbmd2019ws + pcturblo2019ws + pcturbop2019ws)
 
-write_rds(streamcat_watersheds, here("data", "streamcat_watershed_data", "watersheds_streamcat.RDS"))
+write_rds(streamcat_watersheds, here("data", "streamcat_watersheds.rds"))
 
 # remove unnecessary objects
 rm("streamcat_vars", "artificial_modifications", "urban_cover")
+
+# Check if the old sites are still present 
+check_old_sites(streamcat_watersheds)
 ```
 
 ## Find reference quality gages:
@@ -743,21 +716,27 @@ dam storage densities larger than 100 megaliters/square kilometer:
 # ref_watersheds <- watersheds_streamcat %>%
 #   filter(pcturb2019ws < 10) 
   # filter(damnidstorws < 100000)
-# REMOVE THIS STEP ONCE "GOOD" WATERSHEDS HAVE BEEN IDENTIFIED:
-# But for now, this is a quick and lazy way of getting rid of watersheds
-# we know were delineated incorrectly. They were delineated incorrectly
-# because their attributed comids are wrong. (See comment about the weirdos
-# object above):
+
+old_reference_watersheds <- streamcat_watersheds %>% 
+  filter((site_no %in% old_usgs_site_names | abbrev %in% old_cdwr_site_names)) %>% 
+  mutate(area = sf::st_area(.))
+
 reference_watersheds <- streamcat_watersheds %>% 
-  mutate(area = sf::st_area(streamcat_watersheds)) %>%
+  filter(!(site_no %in% old_usgs_site_names | abbrev %in% old_cdwr_site_names)) %>% 
+  mutate(area = sf::st_area(.)) %>%
   # remove any watersheds larger than 1600 km (for some conservative wiggle 
   # with projection differences)
-  filter(as.numeric(area) <= 1.6e+9)
+  filter(as.numeric(area) <= 1.6e+9) %>% 
+  bind_rows(old_reference_watersheds)
 
 # save ref watersheds
 write_rds(reference_watersheds, here("data", "reference_watersheds.rds"))
+
 # remove unnecessary objects
-rm("streamcat_watersheds")
+rm("streamcat_watersheds", "old_reference_watersheds")
+
+# Check if the old sites are still present
+check_old_sites(reference_watersheds)
 ```
 
 And, we can drop any gages whose watersheds contain a transbasin diversion. We 
@@ -771,7 +750,7 @@ watershed unnaturally.
 
 ```{r}
 gage_sites <- read_rds(here("data", "filtered_nwis_cdwr_gages_comid.RDS"))
-watersheds <- read_rds(here("data", "watershed_polygons.RDS"))
+reference_watersheds <- read_rds(here("data", "reference_watersheds.rds"))
 
 # open the nhd_hr - which contains a bunch of layers ----
 nhd_hr <- arcgislayers::arc_open("https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer")
@@ -795,7 +774,7 @@ retry_arc_select <- function(nhd_flowlines, filter_geom_arg, crs_arg, site_info 
     if (!is.null(result)) return(result)
     
     # Exponential backoff with some randomness to prevent concurrent requests
-    wait_time <- 2^attempt + runif(1, 0, 1)
+    wait_time <- 3 + 2^attempt + runif(1, 0, 1)
     message("\nWaiting ", round(wait_time, 1), " seconds before retry...")
     Sys.sleep(wait_time)  # Wait before retrying
   }
@@ -830,7 +809,7 @@ fetch_flowlines <- function(site_no, STUSPS, geometry, nhd_flowlines = nhd_hr_fl
     return(NULL)
   }
   
-  Sys.sleep(runif(1, 0, 2))
+  Sys.sleep(2 + runif(1, 0, 2))
   arc_search_result <- retry_arc_select(
     nhd_flowlines, 
     filter_geom_arg = watershed_aoi, 
@@ -874,9 +853,9 @@ fetch_flowlines <- function(site_no, STUSPS, geometry, nhd_flowlines = nhd_hr_fl
 # First test with a single site to ensure the function works
 message("\n=== Testing with a single site ===")
 single_test <- fetch_flowlines(
-  site_no = watersheds$site_no[21],
-  STUSPS = watersheds$STUSPS[21],
-  geometry = watersheds$geometry[21],
+  site_no = reference_watersheds$site_no[1],
+  STUSPS = reference_watersheds$STUSPS[1],
+  geometry = reference_watersheds$geometry[1],
   nhd_flowlines = nhd_hr_flowlines
 )
 
@@ -894,7 +873,7 @@ furrr_options(
 )
 
 # Select the data we need 
-site_data <- watersheds %>% 
+site_data <- reference_watersheds %>% 
   select(site_no, STUSPS, geometry)
 
 # Process in chunks to reduce memory pressure and server load
@@ -904,8 +883,7 @@ chunks <- split(1:total_sites, ceiling(seq_along(1:total_sites) / chunk_size))
 
 all_results <- list()
 all_successful <- list()
-# update chunks here
-chunks <- chunks[31:length(chunks)]
+
 for (chunk_idx in seq_along(chunks)) {
   
   message("\n=== Processing chunk ", chunk_idx, " of ", length(chunks), " ===")
@@ -1183,7 +1161,7 @@ create_interactive_watershed_map <- function(watershed_processed, gage_sites, si
 }
 
 # Updated transbasin finder ====
-transbasin_finder <- function(site_no, site_data = ref_watersheds) {
+transbasin_finder <- function(site_no, site_data = reference_watersheds) {
   
   # Filter our master list to just the gage watershed we are iterating over ----
   site <- site_data %>% 
@@ -1499,12 +1477,15 @@ transbasin_finder <- function(site_no, site_data = ref_watersheds) {
 }
 
 # Test the function on a single site first ----
-flowline_names <- map(.x=names(all_flowlines_list), ~sub("^.*_", "", .x)) %>% 
+all_flowlines_list_names <- list.files(here("data", "flowlines2"))
+
+flowline_names <- map(.x=all_flowlines_list_names, ~sub("^.*_(.*?)\\.[^.]*$", "\\1", .x)) %>% 
   unlist()
 
-subset_watersheds <- watershed_polygons %>% 
+subset_watersheds <- reference_watersheds %>% 
   filter(site_no %in% flowline_names)
-test_site <- watersheds_div$site_no[1]
+
+test_site <- reference_watersheds$site_no[1]
 
 message("\n=== Testing with site ", test_site, " ===")
 test_result <- transbasin_finder(test_site)
@@ -1512,7 +1493,7 @@ test_result <- transbasin_finder(test_site)
 # Set up parallel processing ----
 
 # Set up parallel processing with fewer workers to reduce server load
-num_workers <- min(availableCores() - 1, 6) # Use at most 4 workers
+num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
 message("Setting up parallel processing with ", num_workers, " workers")
 plan(multisession, workers = num_workers)
 
@@ -1525,7 +1506,7 @@ furrr_options(
 # Chunk the data and run it through `transbasin_finder()` ----
 
 # Get site numbers to process
-site_numbers <- ref_watersheds$site_no
+site_numbers <- reference_watersheds$site_no
 total_sites <- length(site_numbers)
 
 # Process in chunks to reduce memory pressure
@@ -1597,34 +1578,44 @@ if (length(transbasin_finder_results) > 0) {
 }
 ```
 
-
-```{r}
-mapview(filter(watersheds_div, site_no == "06614800")) + mapview(all_flowlines_list[["CO_06614800"]])
-```
-
 Reduce our reference gages to only gages without a transbasin diversion:
 
 ```{r}
-# Add the proper information to the watersheds
-
-# create shapefile folder for the watersheds
-
-# Save the watersheds as a shapefile
-
-# read in streamcat data
-artificial_mod_vars <- c(
-  # Urban Development
-  "pcturbop2019ws", "pcturbmd2019ws", "pcturblo2019ws", "pcturbhi2019ws", 
-  "pcturb2019ws", 
-  
-  # percent impervious
-  "pctimp2006ws", "pctimp2008ws", "pctimp2011ws", "pctimp2001ws", 
-  "pctimp2013ws", "pctimp2019ws", "pctimp2016ws", "pctimp2004ws",
-  
-  # Water Infrastructure
-  "canaldensws", 
-  "damdensws", "damnidstorws", "damnrmstorws"
+# read in urban streamcat data for the watersheds
+# Urban cover metrics - corrected capitalization
+urban_cover <- c(
+  "PctUrbOp2019",     # Percentage of open urban land cover in 2019 (parks, golf courses)
+  "PctUrbMd2019",     # Percentage of medium density urban land cover in 2019
+  "PctUrbLo2019",     # Percentage of low density urban land cover in 2019
+  "PctUrbHi2019",     # Percentage of high density urban land cover in 2019
+  "PctUrbOp2019WS",   # Percentage of open urban land cover in 2019 at watershed scale
+  "PctUrbMd2019WS",   # Percentage of medium density urban land cover in 2019 at watershed scale
+  "PctUrbLo2019WS",   # Percentage of low density urban land cover in 2019 at watershed scale
+  "PctUrbHi2019WS",   # Percentage of high density urban land cover in 2019 at watershed scale
+  "PctUrb2019WS"      # Total percentage of all urban land cover types in 2019 at watershed scale
 )
+
+# Artificial modifications - corrected capitalization
+artificial_modifications <- c(
+  "CanalDens",       # Canal density (km/km²)
+  "DamDens",         # Dam density (dams/km²)
+  "DamNIDStor",      # Dam normal storage (ML/km²)
+  "DamNrmStor"       # Dam maximum storage (ML/km²)
+)
+
+# Retrieve filtering watershed attributes from the EPA's StreamCat database
+streamcat_vars <- StreamCatTools::sc_get_data(
+  # Combine all our desired metrics into a single comma-separated string
+  metric = paste(c(urban_cover, artificial_modifications), collapse = ","),
+  aoi = 'watershed',  # Query for entire watershed upstream of each point
+  comid = watersheds_div$comid) %>%  # Use our previously identified COMIDs
+  # remove excess variables:
+  select(-contains("AREASQKM"))
+
+# combine the watershed polygons with the streamcat data
+streamcat_watersheds <- watersheds %>%
+  left_join(., streamcat_vars, by = "comid") %>%
+  mutate(pcturb2019ws = pcturbhi2019ws + pcturbmd2019ws + pcturblo2019ws + pcturbop2019ws)
 
 streamcat_watersheds_select <- streamcat_watersheds %>%
   select(STUSPS, site_no, comid, all_of(artificial_mod_vars)) %>% 
@@ -1637,8 +1628,6 @@ watersheds_div <- read_rds(here("data", "watersheds_div.RDS"))
 
 filtered_ref_watersheds <- watersheds_div %>%
   filter(transbasin == "NATURAL")
-
-# only 90 reference watersheds
 ```
 
 ### Grab other variables not found in stream cat:
@@ -1717,7 +1706,6 @@ See the function `get_climate_historic()` if you want to see how the raw
 gridMET data is pulled in.
 
 ```{r}
-
 get_climate_historic <- function(sf,
                                  col_name,
                                  start = "1979-01-01",
@@ -1840,11 +1828,6 @@ watershed_climate <- get_climate_historic(sf = filtered_ref_watersheds,
             tmin_C_2001_2020 = mean(tmin_C, na.rm = TRUE))
 ```
 
-```{r}
-# rename the climate data in the climate folder
-
-```
-
 #### Snow persistence
 
 Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is 
@@ -1888,111 +1871,3 @@ watershed_sp <- as_tibble(mean_sp) %>%
   group_by(state, site_no, comid, transbasin) %>% 
   summarize(mean_sp_2001_2020 = mean(value))
 ```
-
-get the list of watersheds to start manually verifying.
-add state specific gages
-
-#### GRAB SSURGO
-```{r}
-# Pull in the reference watersheds
-reference_watersheds <- read_rds(here("data", "watersheds_div.RDS")) %>%
-  filter(transbasin == "NATURAL")
-```
-
-
-```{r}
-grab_ssurgo_data <- function(site_no_arg, watershed_aoi) {
-  
-  # Create raw SSURGO data directory
-  raw_ssurgo_directory_path <- here("data", "raw_ssurgo")
-  
-  if (!dir.exists(raw_ssurgo_directory_path)) {
-    dir.create(raw_ssurgo_directory_path, recursive = TRUE)
-    message("Directory created: ", raw_ssurgo_directory_path)
-  } else {
-    message("Directory already exists: ", raw_ssurgo_directory_path)
-  }
-  
-  # Create processed SSURGO data directory
-  processed_ssurgo_directory_path <- here("data", "processed_ssurgo")
-  
-  if (!dir.exists(processed_ssurgo_directory_path)) {
-    dir.create(processed_ssurgo_directory_path, recursive = TRUE)
-    message("Directory created: ", processed_ssurgo_directory_path)
-  } else {
-    message("Directory already exists: ", processed_ssurgo_directory_path)
-  }
-  
-  ssurgo_data <- get_ssurgo(
-    template = watershed_aoi,
-    label = as.character(site_no_arg), 
-    raw.dir = raw_ssurgo_directory_path,
-    extraction.dir = processed_ssurgo_directory_path,
-    force.redo = FALSE
-  )
-}
-
-# Try with a single site first:
-test_ssurgo <- grab_ssurgo_data(
-  site_no_arg = reference_watersheds$site_no[2],
-  watershed_aoi =  reference_watersheds$geometry[2]
-)
-
-# mapview(test_ssurgo$spatial) + mapview(reference_watersheds$geometry[2])
-
-# ssurgo tabular data ----
-ssurgo_tabular_list <- test_ssurgo$tabular
-
-# Spatial join point which links specific map units (MUKEY) to geographic locations in the watershed: ----
-spatial_df <- test_ssurgo$spatial
-
-# Watershed-level hydrologic properties: ----
-muaggatt_df <- ssurgo_tabular_list$muaggatt %>% 
-  select(musym, # Map unit symbol (key for joining)
-         # Categorical variables
-         hydgrpdcd, # Hydrologic Soil Group (A, B, C, or D)
-         drclassdcd, # Drainage class
-         # Continuous variables
-         aws025wta, aws050wta, aws0100wta, aws0150wta, # Available water storage at different depths
-         slopegradwta, # Slope gradient
-         brockdepmin) # Bed rock depth minimum - indicates potential flow restrictions at depth
-
-# Specific soil components within each map unit: ----
-component_df <- ssurgo_tabular_list$component %>% 
-  select(mukey, cokey, # Keys for joining.
-         comppct.r, # Shows the relative abundance of each soil type (component percentage)
-         hydgrp) # Hydrologic group at the component level
-# Other categorical variables to consider: 
-# drainagecl: Drainage class - more detailed than in the aggregated data.
-# taxsubgrp: Taxonomic subgroup - can indicate soil genesis and behavior.
-# geomdesc: Geomorphic description - landform information that influences water movement.
-
-# Detailed soil properties by depth level: ----
-chorizon_df <- ssurgo_tabular_list$chorizon %>% 
-  select(
-    ksat.r, # Saturated hydraulic conductivity - directly measures water movement rate through soil
-    awc.r, # Available water capacity - amount of plant-available water the soil can store
-    hzdept.r, hzdepb.r, # Horizon depths - important for creating a vertical profile of water movement
-    sandtotal.r, silttotal.r, claytotal.r, # Soil texture components - fundamentally determine water movement and retention
-    om.r, # Organic matter - affects water holding capacity and infiltration
-    dbthirdbar.r # Bulk density - influences porosity and water movement
-  )
-
-# map unit ----
-mapunit_df <- ssurgo_tabular_list$mapunit
-
-
-
-```
-
-
-#### GRAB LANDFIRE
-```{r}
-
-```
-
-#### Elongation ratio and Circumscribing circle
-```{r}
-
-```
-
