@@ -1302,8 +1302,3 @@ watershed_shape_plot_2
 combined_climate_plot
 combined_hydrology_plot
 ```
-
-
-Figure out colinearity
-cross correlations across different predictor variables 
-

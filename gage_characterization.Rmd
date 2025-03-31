@@ -53,6 +53,12 @@ lapply(packages, package_loader)
 options(future.rng.onMisuse = "ignore")
 ```
 
+#Grab all USGS gages
+
+
+options(future.rng.onMisuse = "ignore")
+```
+
 # Load data that's already been run
 ```{r}
 # USGS and CDWR sites data
@@ -134,11 +140,6 @@ check_old_sites <- function(df){
   # Return list of missing sites
   return(list(missing_usgs = missing_usgs, missing_cdwr = missing_cdwr))
 }
-```
-
-#Grab all USGS gages
-
-Using the dataRetrieval package in R, locate all USGS stream gages under 1500 square kilometers that measure discharge.
 
 ```{r}
 # Get a list of NWIS sites for all of the states
@@ -165,16 +166,16 @@ nwis_sites_by_state <- map(c("CO", "WY", "UT", "KS", "NM"), # c("Colorado", "Wyo
                                # Subset the previous sites
                                previous_sites_call <- nwis_call %>% 
                                  filter(site_no %in% old_usgs_site_names)
-                               
-                               # Same filter as above, but first remove the old sites, and
-                               # then filter out the gages that are under 1500 square kilometers
+                               # Only use gages under 1500 square kilometers (as defined by the USGS):
+                               # and exclude the old sites (to join later)
                                final_nwis_call <- nwis_call %>% 
                                  filter(!(site_no %in% old_usgs_site_names)) %>% 
                                  mutate(drain_area_km = drain_area_va *  2.58999) %>%
                                  filter(drain_area_km <= 1500) %>% 
                                  bind_rows(previous_sites_call) %>% 
                                  # For future tracking with the NLDI:
-                                 mutate(nldi_compatible_site_id=if_else(!is.na(site_no), paste0("USGS-", site_no), NA),
+                                 mutate(nldi_compatible_site_id=paste0("USGS-",site_no), # this mutate can happen at the end, after the bind with the CDWR sites
+
                                         STUSPS = .x)
                                
                              }
@@ -186,7 +187,10 @@ nwis_sites_by_state <- map(c("CO", "WY", "UT", "KS", "NM"), # c("Colorado", "Wyo
 nwis_sites <- bind_rows(nwis_sites_by_state) %>%
   st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
 
-# write_rds(nwis_sites, here("data", "nwis_sites_pull.rds"))
+# write_rds(nwis_sites, here("data", "nwis_sites_pull.rds")
+
+# remove unnecessary objects
+rm("nwis_sites_by_state", "us_sf_object", "states_oi")
 gc()
 ```
 
@@ -248,7 +252,7 @@ inventory <- left_join(inventory, table, by = 'site_type_cd') %>%
                                data_type_cd == "ad" ~ "USGS Annual Water Data Report",
                                data_type_cd == "aw" ~ "Active Groundwater Level Network",
                                data_type_cd == "id" ~ "Historic Instantaneous"))
-
+                               
 # write_rds(inventory, here("data", "nwis_inventory.rds"))
 
 old_inventory <- inventory %>% 
@@ -271,6 +275,7 @@ data_filter_nwis_sites <- nwis_sites %>%
          drain_area_km <= 1500,
          site_tp_cd == 'ST') 
 
+
 write_rds(data_filter_nwis_sites, here("data", "initial_filter_nwis_sites.rds"))
 
 # Remove unnecessary objects
@@ -280,6 +285,7 @@ gc()
 
 Grab CO DWR gages
 ```{r, eval = FALSE}
+# This pulls 2529 sites originally, and filters down to 197
 cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
   httr::content(., as = "text", encoding = "UTF-8") %>%
   jsonlite::fromJSON() %>%
@@ -299,7 +305,7 @@ filtered_cdwr_sites <- cdwr_sites %>%
          year(endDate) >= 2024, # Continued measuring until 2024
          !is.na(usgsSiteId),
          !is.na(longitude) & !is.na(latitude),
-         !(usgsSiteId %in% data_filter_nwis_sites$site_no), # Prevent duplicate sites from nwis site filterd data
+         !(usgsSiteId %in% data_filter_nwis_sites$site_no), # Prevent duplicate sites from nwis site filtered data
          # n obs filter for data consistency
          abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>% # Filter for stream gage types
   bind_rows(old_cdwr_sites) %>% # add the old sites into the data
@@ -325,6 +331,7 @@ gc()
 # Check if all the old data is still present
 check_old_sites(gage_sites)
 # site 385626107212000 gets dropped and doesn't get recovered in either of these steps
+
 ```
 
 ## Delineate stream gage watersheds
@@ -622,6 +629,7 @@ for (chunk_idx in seq_along(chunks)) {
   
   write_rds(watershed_delineator_results, here("data", "watershed_polygons.RDS"))
 
+
   # Take a short break between chunks to avoid overloading the server with parallel requests
   if (chunk_idx < length(chunks)) {
     message("Taking a short break before next chunk...")
@@ -629,6 +637,7 @@ for (chunk_idx in seq_along(chunks)) {
     # Garbage collection after each chunk
     gc()
     Sys.sleep(5)
+
   }
 }
 
@@ -775,6 +784,7 @@ retry_arc_select <- function(nhd_flowlines, filter_geom_arg, crs_arg, site_info 
     
     # Exponential backoff with some randomness to prevent concurrent requests
     wait_time <- 3 + 2^attempt + runif(1, 0, 1)
+
     message("\nWaiting ", round(wait_time, 1), " seconds before retry...")
     Sys.sleep(wait_time)  # Wait before retrying
   }
@@ -810,6 +820,7 @@ fetch_flowlines <- function(site_no, STUSPS, geometry, nhd_flowlines = nhd_hr_fl
   }
   
   Sys.sleep(2 + runif(1, 0, 2))
+
   arc_search_result <- retry_arc_select(
     nhd_flowlines, 
     filter_geom_arg = watershed_aoi, 
@@ -878,6 +889,7 @@ site_data <- reference_watersheds %>%
 
 # Process in chunks to reduce memory pressure and server load
 chunk_size <- 10
+
 total_sites <- nrow(site_data)
 chunks <- split(1:total_sites, ceiling(seq_along(1:total_sites) / chunk_size))
 
@@ -885,7 +897,7 @@ all_results <- list()
 all_successful <- list()
 
 for (chunk_idx in seq_along(chunks)) {
-  
+
   message("\n=== Processing chunk ", chunk_idx, " of ", length(chunks), " ===")
   
   # Get the indices for this chunk
@@ -930,6 +942,10 @@ for (chunk_idx in seq_along(chunks)) {
   # Garbage collection between chunks
   gc()
   
+  message("All done! Processed ", length(successful_results), " sites with a total of ", 
+          nrow(all_flowlines), " flowlines.")
+} else {
+  message("No successful results to process.")
 }
 
 # Process final results ----
@@ -975,7 +991,6 @@ rm(
   "chunk_idx", "site_data", "errors", "single_test", "total_sites",
   "num_workers", "chunk_size", "results_transposed"
 )
-
 ```
 
 ```{r}
@@ -1519,7 +1534,6 @@ transbasin_finder_results <- list()
 
 for (chunk_idx in seq_along(chunks)) {
   message("=== Processing chunk ", chunk_idx, " of ", length(chunks))
-
   # Get the sites for this chunk
   chunk_sites <- chunks[[chunk_idx]]
   
@@ -1628,6 +1642,8 @@ watersheds_div <- read_rds(here("data", "watersheds_div.RDS"))
 
 filtered_ref_watersheds <- watersheds_div %>%
   filter(transbasin == "NATURAL")
+
+# only 90 reference watersheds
 ```
 
 ### Grab other variables not found in stream cat:
@@ -1828,6 +1844,11 @@ watershed_climate <- get_climate_historic(sf = filtered_ref_watersheds,
             tmin_C_2001_2020 = mean(tmin_C, na.rm = TRUE))
 ```
 
+```{r}
+# rename the climate data in the climate folder
+
+```
+
 #### Snow persistence
 
 Here I am loading in all the snow persistence data I downloaded from: <https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930>. There is 
@@ -1871,3 +1892,100 @@ watershed_sp <- as_tibble(mean_sp) %>%
   group_by(state, site_no, comid, transbasin) %>% 
   summarize(mean_sp_2001_2020 = mean(value))
 ```
+
+get the list of watersheds to start manually verifying.
+add state specific gages
+
+#### GRAB SSURGO
+```{r}
+# Pull in the reference watersheds
+reference_watersheds <- read_rds(here("data", "watersheds_div.RDS")) %>%
+  filter(transbasin == "NATURAL")
+```
+
+
+```{r}
+grab_ssurgo_data <- function(site_no_arg, watershed_aoi) {
+  
+  # Create raw SSURGO data directory
+  raw_ssurgo_directory_path <- here("data", "raw_ssurgo")
+  
+  if (!dir.exists(raw_ssurgo_directory_path)) {
+    dir.create(raw_ssurgo_directory_path, recursive = TRUE)
+    message("Directory created: ", raw_ssurgo_directory_path)
+  } else {
+    message("Directory already exists: ", raw_ssurgo_directory_path)
+  }
+  
+  # Create processed SSURGO data directory
+  processed_ssurgo_directory_path <- here("data", "processed_ssurgo")
+  
+  if (!dir.exists(processed_ssurgo_directory_path)) {
+    dir.create(processed_ssurgo_directory_path, recursive = TRUE)
+    message("Directory created: ", processed_ssurgo_directory_path)
+  } else {
+    message("Directory already exists: ", processed_ssurgo_directory_path)
+  }
+  
+  ssurgo_data <- get_ssurgo(
+    template = watershed_aoi,
+    label = as.character(site_no_arg), 
+    raw.dir = raw_ssurgo_directory_path,
+    extraction.dir = processed_ssurgo_directory_path,
+    force.redo = FALSE
+  )
+}
+
+# Try with a single site first:
+test_ssurgo <- grab_ssurgo_data(
+  site_no_arg = reference_watersheds$site_no[2],
+  watershed_aoi =  reference_watersheds$geometry[2]
+)
+
+# mapview(test_ssurgo$spatial) + mapview(reference_watersheds$geometry[2])
+
+# ssurgo tabular data ----
+ssurgo_tabular_list <- test_ssurgo$tabular
+
+# Spatial join point which links specific map units (MUKEY) to geographic locations in the watershed: ----
+spatial_df <- test_ssurgo$spatial
+
+# Watershed-level hydrologic properties: ----
+muaggatt_df <- ssurgo_tabular_list$muaggatt %>% 
+  select(musym, # Map unit symbol (key for joining)
+         # Categorical variables
+         hydgrpdcd, # Hydrologic Soil Group (A, B, C, or D)
+         drclassdcd, # Drainage class
+         # Continuous variables
+         aws025wta, aws050wta, aws0100wta, aws0150wta, # Available water storage at different depths
+         slopegradwta, # Slope gradient
+         brockdepmin) # Bed rock depth minimum - indicates potential flow restrictions at depth
+
+# Specific soil components within each map unit: ----
+component_df <- ssurgo_tabular_list$component %>% 
+  select(mukey, cokey, # Keys for joining.
+         comppct.r, # Shows the relative abundance of each soil type (component percentage)
+         hydgrp) # Hydrologic group at the component level
+# Other categorical variables to consider: 
+# drainagecl: Drainage class - more detailed than in the aggregated data.
+# taxsubgrp: Taxonomic subgroup - can indicate soil genesis and behavior.
+# geomdesc: Geomorphic description - landform information that influences water movement.
+
+# Detailed soil properties by depth level: ----
+chorizon_df <- ssurgo_tabular_list$chorizon %>% 
+  select(
+    ksat.r, # Saturated hydraulic conductivity - directly measures water movement rate through soil
+    awc.r, # Available water capacity - amount of plant-available water the soil can store
+    hzdept.r, hzdepb.r, # Horizon depths - important for creating a vertical profile of water movement
+    sandtotal.r, silttotal.r, claytotal.r, # Soil texture components - fundamentally determine water movement and retention
+    om.r, # Organic matter - affects water holding capacity and infiltration
+    dbthirdbar.r # Bulk density - influences porosity and water movement
+  )
+
+# map unit ----
+mapunit_df <- ssurgo_tabular_list$mapunit
+
+
+
+```
+
