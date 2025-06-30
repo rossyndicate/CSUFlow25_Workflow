@@ -54,5 +54,7 @@ rsconnect/
 ## Data folder
 data/
 
+scratch/
+
 ## Documentation
 documentation/*.html
