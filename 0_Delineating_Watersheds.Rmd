@@ -191,7 +191,7 @@ usgs_ids <- c(7099060, 7105000, 6725500, 402114000000000, 6739500, 7103703, 7122
 model_watersheds <- all_sites %>%
   filter(abbrev %in% cdwr_ids | 
           as.numeric(site_no) %in% usgs_ids) %>%
-  select(rowid,
+  select(index = rowid,
          cdwr_id = abbrev,
          usgs_id = site_no) %>%
   st_drop_geometry() %>%
