@@ -1,0 +1,205 @@
+---
+title: "0_Delineating_Watersheds"
+author: "Katie Willi"
+date: "2025-06-30"
+output: html_document
+---
+
+```{r}
+library(dataRetrieval)
+library(nhdplusTools)
+library(sf)
+library(mapview)
+library(data.table)
+library(tidyverse)
+
+list.files("src/", full.names = TRUE) %>% walk(~source(.))
+```
+
+# Getting a list of gages
+
+Using the dataRetrieval package in R, locate all USGS stream gages that measure discharge.
+
+```{r}
+states_oi <- c("Colorado", "Nebraska", "Wyoming", "Utah", "New Mexico", "Kansas")
+
+us_sf_object <- tigris::states() %>%
+  filter(NAME %in% states_oi)
+
+# Get a list of NWIS sites for all of the states
+nwis_sites_by_state <- map(c("CO", "NE", "WY", "UT", "NM", "KS"), #us_sf_object$STUSPS, 
+                           ~{
+                             discharge_sites <- whatNWISsites(stateCd = .x, parameterCd = "00060") %>%
+                               filter(site_tp_cd == 'ST')
+                             
+                             # Only use gages under 1500 square kilometers (as defined by the USGS) with some wiggle:
+                             small_enough <- readNWISsite(discharge_sites$site_no) %>%  
+                               mutate(drain_area_km = drain_area_va *  2.58999) %>%  
+                               filter(drain_area_km <= 1600) 
+                             
+                             return(small_enough)
+                           }
+)
+
+nwis_sites <- bind_rows(nwis_sites_by_state) %>%
+  distinct(.) %>%
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
+
+mapview(nwis_sites)
+```
+
+Next grab CO DWR gages...
+
+```{r}
+# Pull ALL CDWR sites that are also stream gages: 
+cdwr_sites <- httr::GET(url = "https://dwr.state.co.us/Rest/GET/api/v2/surfacewater/surfacewaterstations/?format=json&fields=stationNum%2Cabbrev%2CusgsSiteId%2CstationName%2CutmX%2CutmY%2Clatitude%2Clongitude%2CstartDate%2CendDate%2CmeasUnit") %>%
+  httr::content(., as = "text", encoding = "UTF-8") %>%
+  jsonlite::fromJSON() %>%
+  .[["ResultList"]] %>%
+  mutate(combo = ifelse(is.na(abbrev), usgsSiteId, abbrev)) %>%
+  filter(!is.na(longitude) & !is.na(latitude)) %>%
+  filter(year(endDate) > "1999",
+         year(startDate) <= "1999") %>%
+  # Station type cannot be accessed on API only GUI
+  filter(abbrev %in% c(read_csv("data/cdwr.csv") %>%.$Abbrev)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4269) %>%
+  select(combo,
+         abbrev,
+         co_usgs = usgsSiteId,
+         station_nm = stationName) %>%
+  # remove dupes caused by adding Abby's in:
+  distinct()
+```
+
+Lastly bind USGS and Colorado gages together:
+
+```{r}
+# Bind CO DWR and USGS sites together
+all_sites <- nwis_sites %>% 
+  mutate(combo = site_no) %>% bind_rows(cdwr_sites) %>%
+  distinct() %>%
+  rowid_to_column()
+```
+
+Delineate each gage's watershed
+
+```{r}
+all_sites$comid <- NA # if that doesn't work for all gages, do 'discover_nhdplus_id()'
+
+# get the comid using the weirdos' coordinates instead of their gage name
+for(i in 1:nrow(all_sites)){
+  try(all_sites$comid[i] <- discover_nhdplus_id(all_sites[i,]))
+}
+```
+
+# Delineating gage watersheds
+
+We have a list of our gages and their associated NHDPlus V2 stream features, we can use the NHD indexing to "crawl" upstream of each gage's flowline, then grab each flowline's catchment, and lastly dissolve those catchments into a single polygon that represents the gage's upstream contributing area (i.e., its watershed).
+
+```{r}
+# load in the NHD as a table. This table lists all COMIDs in CONUS and allows you to "navigate" the NHD.
+nhd <- read_csv("data/nhd_flow_network.csv")
+
+# Create a vector of nwis sites to iterate over
+all_sites %>% 
+  pull(rowid) %>%
+  #... then delineate each site's watershed:
+  walk(~try(watershed_delineator(.))) 
+
+raw_watersheds <- list.files("data/raw_watersheds/", full.names = TRUE) %>%
+  map_dfr(~readRDS(.))
+
+# check if they all look correct
+saveRDS(raw_watersheds, "data/gage_watersheds.shp")
+```
+
+# Grab StreamCat data for determining human modification:
+
+Grab info about dams, urban landcover, canal density.
+
+```{r}
+selected_vars <- c(
+  "pcturbop2019",  # Percentage of open urban land cover in 2019 (parks, golf courses, large-lot development)
+  "pcturbmd2019",  # Percentage of medium density urban land cover in 2019 (mix of constructed materials and vegetation)
+  "pcturblo2019",  # Percentage of low density urban land cover in 2019 (single-family housing areas)
+  "pcturbhi2019" ,  # Percentage of high density urban land cover in 2019 (apartments, commercial/industrial)
+  "canaldens",   # Canal density (km/km²) 
+  "damdens",     # Dam density (dams/km²)
+  "damnidstor",  # Dam normal storage (ML/km²)
+  "damnrmstor"   # Dam maximum storage (ML/km²)
+)
+
+raw_watersheds <- raw_watersheds %>%
+  left_join(simple_streamcat_data(df = raw_watersheds) %>% st_drop_geometry() %>% select(rowid, 8:14), by = "rowid")
+```
+
+Grab transbasin diversion data:
+
+```{r}
+raw_watersheds$rowid %>%
+  walk(~try(fetch_stream_mods(.)))
+
+modification_features <- list.files("data/raw_modifications/", full.names = TRUE) %>%
+  map(~try(readRDS(.))) %>%
+  keep(~is.data.frame(.)) %>%
+  bind_rows()
+
+mapview(modification_features[1,])
+
+transbasin_diversions <- raw_watersheds$rowid %>%
+  map(~transbasin_finder(.))
+
+```
+
+Now, we can look at each watershed visually to determine which watersheds are appropriate for use in model development (based on this information as well as additional information provided by CWCB). The following are the sites identified as being of reference quality through this exercise.
+
+```{r}
+# CDWR IDs
+cdwr_ids <- c("BEAPENCO", "BEARCOCO", "BOCMIDCO", "BTBMORCO", "BUCRMVCO", "CAMPGOCO", 
+              "CANSWKCO", "CARLAGCO", "CASCOSNM", "CCACCRCO", "CEMSILCO", "CHCRNACO", 
+              "CHECRECO", "CHEEVACO", "CHENEFCO", "CHEREDCO", "COCRBVCO", "COCREPCO", 
+              "COCRESCO", "COCRMICO", "CRBRLVCO", "CRHBLVCO", "CROMINCO", "CRYAVACO", 
+              "DOLRICCO", "EASCEMCO", "ELKLONCO", "ELKMILCO", "ERIRGRCO", "FISCRECO", 
+              "FLOALECO", "FOUHIGCO", "FRYNFNCO", "GARVILCO", "GOOWAGCO", "GRAWESCO", 
+              "HALMALCO", "HAYREDCO", "HURREDCO", "JEFJEFCO", "JIMCAMCO", "KERVILCO", 
+              "KEYGUDCO", "LAGLAGCO", "LAJCAPCO", "LAKATLCO", "LAKFORCO", "LKCTURCO", 
+              "LOSORTCO", "LSRSLACO", "LTCANYCO", "LUARMOCO", "MAJVILCO", "MANMANCO", 
+              "MEDSANCO", "MFKABMCO", "MIDSTECO", "MUDAACCO", "NAVBANCO", "NOCRESCO", 
+              "OHGJEFCO", "PICRYACO", "PINDELCO", "PINSTBCO", "PLUCASCO", "PURMADCO", 
+              "RALCRKCO", "RCKTARCO", "RITCRECO", "SANCRECO", "SANDUNCO", "SANFTGCO", 
+              "SANORTCO", "SFKANTCO", "SLAFORCO", "SNOCRECO", "SOUCRECO", "SPACRECO", 
+              "SSVWARCO", "SVCLYOCO", "TAYATPCO", "TIMSWICO", "TRITURCO", "TROGARCO", 
+              "UTEFTGCO", "VALBAYCO", "VANMODCO", "WESRIFCO", "WFKCROCO", "WILCRECO", 
+              "WILDHOCO", "WINDESCO", "YELWHICO")
+
+# USGS IDs
+usgs_ids <- c(7099060, 7105000, 6725500, 402114000000000, 6739500, 7103703, 7122400, 
+              8230500, 8253000, 7086500, 9358550, 7091015, 7105490, 6712000, 7089250, 
+              6730300, 8229500, 8226700, 7114000, 9065100, 9081600, 9165000, 9112200, 
+              9246200, 9242500, 9238900, 9362750, 8218500, 7095000, 7083000, 7111000, 
+              6698000, 7105900, 8224500, 9047700, 8231000, 8238000, 7084500, 9124500, 
+              8248000, 9253000, 7126100, 9041090, 6309200, 6622700, 6632400, 6755960, 
+              6823500, 6824000, 6836500, 7203000, 7207500, 7208500, 7218000, 8267500, 
+              8269000, 8271000, 8275500, 8277470, 8289000, 8291000, 8302500, 8315480, 
+              8324000, 8334000, 8377900, 8380500, 9025300, 9066000, 9066300, 9217900, 
+              9220000, 9279000, 9289500, 9292000, 9296800, 9299500, 9378170, 9378630, 
+              9386900, 401733000000000, 9344000, 8227500, 9306200, 8220500, 9059500, 
+              6708800, 7124200, 8241500, 8247500, 9255000, 9077000, 6722500, 6724000, 
+              9107000, 7121500, 8240500, 8242500, 9352900, 7126200, 8235270, 7134990, 
+              9306255)
+
+model_watersheds <- all_sites %>%
+  filter(abbrev %in% cdwr_ids | 
+          as.numeric(site_no) %in% usgs_ids) %>%
+  select(rowid,
+         cdwr_id = abbrev,
+         usgs_id = site_no) %>%
+  st_drop_geometry() %>%
+  inner_join(., raw_watersheds %>% select(rowid, geometry), by = "rowid") %>%
+  st_as_sf(., crs = 4326)
+
+mapview(model_watersheds)
+
+saveRDS(model_watersheds, "data/model_watersheds.RDS")
+```
+
