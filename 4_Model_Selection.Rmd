@@ -37,7 +37,8 @@ flow <- read_csv("data/streamflow/hydro_signatures_wet_dry.csv") %>%
     flood_freq_1.5_Q_mmd
   )
 
-predictors <- read_csv("data/watersheds_with_vars.csv")
+predictors <- read_csv("data/watersheds_with_vars.csv") %>%
+  select(-c(cdwr_id, usgs_id, comid))
 
 vars <- flow %>%
   inner_join(predictors, by = "index") %>%

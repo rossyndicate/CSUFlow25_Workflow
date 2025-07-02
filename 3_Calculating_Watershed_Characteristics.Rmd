@@ -28,8 +28,7 @@ list.files("src/", full.names = TRUE) %>% walk(~source(.))
 Pull in our model watersheds
 
 ```{r}
-watersheds <- readRDS("data/model_watersheds.RDS") %>%
-  .[1:5,]
+watersheds <- readRDS("data/model_watersheds.RDS") 
 ```
 
 ##### STATSGO data from StreamCate
