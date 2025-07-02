@@ -2,7 +2,7 @@
 fetch_stream_mods <- function(site_list){
   
   data <- raw_watersheds %>%
-    filter(rowid == site_list)
+    filter(index == site_list)
   
   nhd_plus_hr_url <- "https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer"
   
@@ -83,7 +83,7 @@ fetch_stream_mods <- function(site_list){
       silent = TRUE)
   
   if (is.data.frame(nhd_flowlines) && nrow(nhd_flowlines) > 0) {
-    saveRDS(nhd_flowlines, paste0("data/raw_modifications/", data$rowid, ".RDS"))
+    saveRDS(nhd_flowlines, paste0("data/raw_modifications/", data$index, ".RDS"))
   } else {
     message("Skipping saveRDS: nhd_flowlines is either not a data frame or is empty.")
   }

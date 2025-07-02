@@ -1,15 +1,15 @@
 transbasin_finder <- function(site_list){
   
   site <- raw_watersheds %>%
-    filter(rowid == site_list)
+    filter(index == site_list)
   
   flowlines_unnatural <- NA
   
-  flowlines_unnatural <- readRDS(paste0("data/raw_modifications/", site$rowid, ".RDS"))
+  flowlines_unnatural <- readRDS(paste0("data/raw_modifications/", site$index, ".RDS"))
   
   if(!is.data.frame(flowlines_unnatural)){
     
-    return(site)
+    return(site %>% mutate(transbasin_diversion = NA) %>% select(index, transbasin_diversion) %>% st_drop_geometry())
     
   }
   
@@ -27,7 +27,9 @@ transbasin_finder <- function(site_list){
     nrow()
   
   site <- site %>%
-    mutate(transbasin_diversion = ifelse(crossovers > 0, "transbasin diversion", NA))
+    mutate(transbasin_diversion = ifelse(crossovers > 0, "transbasin diversion", NA)) %>%
+    select(index, transbasin_diversion) %>%
+    st_drop_geometry()
   
   return(site)
   

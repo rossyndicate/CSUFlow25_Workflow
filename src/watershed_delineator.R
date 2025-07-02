@@ -3,7 +3,7 @@ watershed_delineator <- function(site_list){
   
   # Filter to get a specific site from the dataset and transform to WGS84 coordinate system
   site <- all_sites %>%
-    filter(rowid == site_list) %>%
+    filter(index == site_list) %>%
     st_transform(4326)
   
   # these are watersheds that are contained within a catchment (very small). require
@@ -48,7 +48,7 @@ watershed_delineator <- function(site_list){
       select(-catchmentID,-id) %>%  # Remove unnecessary columns
       mutate(ws_flag = "SMALL") %>%  # Add a flag indicating this is a small watershed
       # Add site information and initialize area metrics as NA
-      dplyr::mutate(rowid = site$rowid,
+      dplyr::mutate(index = site$index,
                     combo = site$combo,
                     comid = site$comid,
                     area_original_m2 = NA,
@@ -196,7 +196,7 @@ watershed_delineator <- function(site_list){
       # line up perfectly:
       nngeo::st_remove_holes() %>%
       # tack on the site name and comid to the watershed
-      dplyr::mutate(rowid = site$rowid,
+      dplyr::mutate(index = site$index,
                     combo = site$combo,
                     comid = site$comid,
                     area_original_m2 = as.numeric(site_catch),
@@ -206,7 +206,7 @@ watershed_delineator <- function(site_list){
     # mapview(nhd_watershed) + site + flowline
     
     # back it up:
-    saveRDS(nhd_watershed, paste0("data/raw_watersheds/", site$rowid, ".RDS"))
+    saveRDS(nhd_watershed, paste0("data/raw_watersheds/", site$index, ".RDS"))
     
     message(paste0(site$station_nm, " delineated!"))
     

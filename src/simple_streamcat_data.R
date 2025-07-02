@@ -8,6 +8,7 @@ streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(selected_vars, coll
   select(-contains("areasqkm"))
 
 streamcat_list_simple <- df %>%
+  select(index, comid) %>%
   left_join(., streamcat_vars, by = "comid")
 
   return(streamcat_list_simple)

@@ -45,6 +45,24 @@ nwis_sites <- bind_rows(nwis_sites_by_state) %>%
   distinct(.) %>%
   st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269)
 
+nwis_site_meta <- map_dfr(nwis_sites$site_no, function(chunk) {
+      dataRetrieval::whatNWISdata(siteNumber = chunk,
+                                  parameterCd = "00060") %>%
+        dplyr::select(c(site_no,
+                        site_name = station_nm,
+                        n_obs = count_nu,
+                        begin_date,
+                        end_date,
+                        code = parm_cd)) %>%
+    mutate(across(everything(), as.character))
+
+    
+    }) %>%
+  filter(ymd(begin_date) <= "1999-10-01" & ymd(end_date) >= "2024-09-30")
+
+nwis_sites <- nwis_sites %>%
+  filter(site_no %in% nwis_site_meta$site_no)
+
 mapview(nwis_sites)
 ```
 
@@ -78,7 +96,7 @@ Lastly bind USGS and Colorado gages together:
 all_sites <- nwis_sites %>% 
   mutate(combo = site_no) %>% bind_rows(cdwr_sites) %>%
   distinct() %>%
-  rowid_to_column()
+  rowid_to_column(var = "index")
 ```
 
 Delineate each gage's watershed
@@ -102,15 +120,12 @@ nhd <- read_csv("data/nhd_flow_network.csv")
 
 # Create a vector of nwis sites to iterate over
 all_sites %>% 
-  pull(rowid) %>%
+  pull(index) %>%
   #... then delineate each site's watershed:
   walk(~try(watershed_delineator(.))) 
 
 raw_watersheds <- list.files("data/raw_watersheds/", full.names = TRUE) %>%
   map_dfr(~readRDS(.))
-
-# check if they all look correct
-saveRDS(raw_watersheds, "data/gage_watersheds.shp")
 ```
 
 # Grab StreamCat data for determining human modification:
@@ -130,13 +145,13 @@ selected_vars <- c(
 )
 
 raw_watersheds <- raw_watersheds %>%
-  left_join(simple_streamcat_data(df = raw_watersheds) %>% st_drop_geometry() %>% select(rowid, 8:14), by = "rowid")
+  left_join(simple_streamcat_data(df = raw_watersheds) %>% st_drop_geometry() %>% select(-comid), by = "index")
 ```
 
 Grab transbasin diversion data:
 
 ```{r}
-raw_watersheds$rowid %>%
+raw_watersheds$index %>%
   walk(~try(fetch_stream_mods(.)))
 
 modification_features <- list.files("data/raw_modifications/", full.names = TRUE) %>%
@@ -146,9 +161,15 @@ modification_features <- list.files("data/raw_modifications/", full.names = TRUE
 
 mapview(modification_features[1,])
 
-transbasin_diversions <- raw_watersheds$rowid %>%
-  map(~transbasin_finder(.))
+transbasin_diversions <- list.files("data/raw_modifications/", full.names = FALSE) %>%
+  tools::file_path_sans_ext() %>%
+  map(~transbasin_finder(.)) %>%
+  bind_rows() 
 
+raw_watersheds <- raw_watersheds %>%
+  left_join(transbasin_diversions, by = "index")
+
+st_write(raw_watersheds, "data/raw_watersheds.shp", append = FALSE)
 ```
 
 Now, we can look at each watershed visually to determine which watersheds are appropriate for use in model development (based on this information as well as additional information provided by CWCB). The following are the sites identified as being of reference quality through this exercise.
@@ -191,16 +212,18 @@ usgs_ids <- c(7099060, 7105000, 6725500, 402114000000000, 6739500, 7103703, 7122
 model_watersheds <- all_sites %>%
   filter(abbrev %in% cdwr_ids | 
           as.numeric(site_no) %in% usgs_ids) %>%
-  select(rowid,
+  select(index,
+         comid,
          cdwr_id = abbrev,
          usgs_id = site_no) %>%
   st_drop_geometry() %>%
-  inner_join(., raw_watersheds %>% mutate(ws_area_sqkm = st_area(.)) %>% select(rowid, ws_area_sqkm, geometry), by = "rowid") %>%
-  st_as_sf(., crs = 4326) %>%
-  rename(index = rowid)
+  inner_join(., raw_watersheds %>% mutate(ws_area_sqkm = as.numeric(st_area(.))/1000000) %>% select(index, ws_area_sqkm, geometry), by = "index") %>%
+  st_as_sf(., crs = 4326)
 
 mapview(model_watersheds)
 
 saveRDS(model_watersheds, "data/model_watersheds.RDS")
+st_write(model_watersheds, "data/model_watersheds.shp", append = FALSE)
+write_csv(model_watersheds %>% st_drop_geometry(), "data/model_watersheds.csv")
 ```
 
