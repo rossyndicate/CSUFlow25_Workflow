@@ -5,6 +5,7 @@ library(gridExtra)
 library(scales)
 library(cowplot)
 library(grid)
+library(hydroGOF)
 
 # stats:
 
@@ -16,8 +17,8 @@ new_sub_models <- list.files("data/model_results_no_burn/", pattern = "all_model
   mutate(flow_stat = ifelse(flow_stat == "q_ann_mm", "ann",
                             ifelse(flow_stat == "winter_mm", "winter_monthly_avg",
                                    flow_stat))) %>%
-  filter(model_type == "MLR_Train") %>%
-  mutate(model_type = "CSUFlow25") #%>%
+  #filter(model_type == "MLR_Train") %>%
+  mutate(model_type = paste0("CSUFlow25: ", model_type)) #%>%
 # filter(!flow_stat %in% c("annual_mean_max", "annual_mean_min", "annual_mean", "mean_flowdate_0.1", "mean_flowdate_0.2",
 #                          "mean_flowdate_0.3", "mean_flowdate_0.4", "mean_flowdate_0.5", "mean_flowdate_0.6", "mean_flowdate_0.7", "mean_flowdate_0.8",
 #                          "mean_flowdate_0.9", "monsoon_frac", "q5", "q95", "flood_freq_1.5", 
@@ -30,12 +31,13 @@ usgs_models <- read_csv("data/USGSvsFlow25_nse 1.csv") %>%
          PBIAS = bias,
          usgs_hydro_region = region) %>%
   mutate(model_type = paste0("USGS")) #%>%
-  #filter(usgs_hydro_region != "all") 
+#filter(usgs_hydro_region != "all") 
 
 all_model_stats <- bind_rows(abby_models, new_sub_models) %>%
   bind_rows(usgs_models) %>%
   select(flow_stat, model_type, usgs_hydro_region, NSE, PBIAS, CV, model = vars) %>%
-  mutate(flow_stat = tolower(flow_stat))
+  mutate(flow_stat = tolower(flow_stat)) %>%
+  select(-CV)
 
 write_csv(all_model_stats, "data/all_models_stats_no_burn.csv")
 
@@ -75,16 +77,16 @@ usgs_obs <- usgs_raw %>%
          all_ann_Q_mm_usgs = QA_mm,
          usgs_hydro_region)  %>%
   pivot_longer(cols = -c("gage_used", "index", "usgs_hydro_region"),
-    names_to = "stat_source",
-    values_to = "value") %>%
+               names_to = "stat_source",
+               values_to = "value") %>%
   filter(!is.na(value)) %>%
   extract(stat_source, into = c("stat", "source"), regex = "^(all_.*)_Q_mm_(csu|usgs)$") %>%
   filter(!is.na(source)) %>%
   pivot_wider(names_from = source,
-    values_from = value) %>%
+              values_from = value) %>%
   select(gage_used, index, flow_stat = stat, obs = csu, pred = usgs, usgs_hydro_region) %>%
   mutate(model_type = "USGS",
-    flow_stat = str_remove(flow_stat, "^all_")) 
+         flow_stat = str_remove(flow_stat, "^all_")) 
 
 abby_obs <- read_csv("data/csuflow18_obs_predict.csv") %>%
   mutate(model_type = "CSUFlow18")
@@ -107,27 +109,31 @@ all_obs_pred <- bind_rows(flow25_obs, usgs_obs, abby_obs) %>%
 write_csv(all_obs_pred, "data/all_models_obs_pred_no_burn.csv")
 
 
+
+# Getting stats across CSUFlow25 hydrologic regions:
+
+all_csuflow25_obs <- list.files("data/model_results_no_burn/", pattern = "obs_pred_", full.names = TRUE) %>%
+  map_dfr(~read_csv(.)) %>%
+  mutate(model_type = ifelse(model_type == "MLR_Train", "CSUFlow25 - Training", "CSUFlow25 - CV")) %>%
+  left_join(., read_csv("data/0-FINAL-DELIVERABLES/watersheds_with_vars_20250624.csv")  %>%
+              select(gage_used, hyd_region), by = c("site_name" = "gage_used")) %>%
+  group_by(hyd_region, dataset, flow_stat) %>%
+  summarize(NSE = NSE(predicted, observed),
+            PBIAS = pbias(predicted, observed),
+            R2 = cor(predicted, observed)^2,
+            RMSE = rmse(predicted, observed)) %>%
+  write_csv('data/stats_no_burn_by_hyd_region.csv')
+
+
+
+
+
+
+# summary stats for all csuflow25 models:
+
 all_csuflow25_stats <- list.files("data/model_results_no_burn/", pattern = "all_model_stats", full.names = TRUE) %>%
   map_dfr(~read_csv(.)) %>%
   mutate(model_type = ifelse(model_type == "MLR_Train", "CSUFlow25 - Training", "CSUFlow25 - CV"))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 # Read the data
 data <- all_obs_pred %>%
@@ -238,7 +244,7 @@ create_flow_plots <- function(flow_stat_name) {
                                   paste0("Q", flow_stat_name),
                                   gp = grid::gpar(fontsize = 24, fontface = "bold")
                                 ))
-                                
+  
   
   return(list(csuflow25 = p1, csuflow18 = p2, usgs = p3, combined = combined_plot))
 }

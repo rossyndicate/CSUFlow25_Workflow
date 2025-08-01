@@ -303,4 +303,3 @@ grab_models <- function(metric_index){
 unique(1:n_distinct(model_list$flow_stat)) %>%
   walk(~grab_models(.)) 
 ```
-
