@@ -99,7 +99,7 @@ all_sites <- nwis_sites %>%
   rowid_to_column(var = "index")
 ```
 
-Delineate each gage's watershed
+Grabbing NHD comids for all sites:
 
 ```{r}
 all_sites$comid <- NA # if that doesn't work for all gages, do 'discover_nhdplus_id()'
